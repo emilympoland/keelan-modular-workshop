@@ -1,0 +1,56 @@
+#!/bin/bash
+#
+# Check — challenge 10 (prompts)
+#
+# No strict set flags (house default): every probe is handled explicitly so the
+# fail-message always reaches the learner instead of the script dying on an
+# unset variable.
+#
+# Reads the prompt back from the learner's Prompt Hub (check_langsmith.py
+# prompt): at least two commits, and the latest one is prompt_v2 -- which only
+# the blanked push writes.
+#
+# Time budget: a few bounded LangSmith queries, well inside the ~60s ceiling;
+# a killed check never shows its message.
+
+_fail() {
+  fail-message "$1" 2>/dev/null || echo "FAIL: $1" >&2
+  exit 1
+}
+
+ENV_FILE=/opt/workshop/.env
+VENV_PY=/opt/workshop/.venv/bin/python
+
+if [ ! -f "$ENV_FILE" ]; then
+  _fail "Setup hasn't finished yet. Wait a moment and click Check again."
+fi
+
+# [Check 1/2] a LangSmith key is stored. This challenge requires one.
+if [ ! -f /tmp/.credentials-ok ] || ! grep -q '^LANGSMITH_API_KEY=lsv2_' "$ENV_FILE"; then
+  _fail "[Check 1/2] This challenge needs a LangSmith key. Re-run the first cell of 01_setup.ipynb and enter one, then re-run 10_prompts.ipynb from the top."
+fi
+
+# [Check 2/2] the live assertion, read from the learner's workspace.
+timeout --kill-after=3 50 "$VENV_PY" /opt/instruqt-workshop/check_langsmith.py prompt
+rc=$?
+
+case "$rc" in
+  0)
+    exit 0
+    ;;
+  4)
+    _fail "[Check 2/2] The prompt client-research-assistant-<suffix> is missing or has one commit. Run the push cell under '3', then uncomment and run the push of prompt_v2 under '5'."
+    ;;
+  5)
+    _fail "[Check 2/2] Your prompt's latest commit isn't prompt_v2. Uncomment the two push lines under '5. Version it yourself' and run the cell."
+    ;;
+  3)
+    _fail "[Check 2/2] No LangSmith key is stored. Re-run the first cell of 01_setup.ipynb and enter one."
+    ;;
+  124 | 137)
+    _fail "[Check 2/2] LangSmith didn't answer in time. Usually a slow moment, not your work — click Check again."
+    ;;
+  *)
+    _fail "[Check 2/2] Couldn't read your LangSmith workspace. Re-run the last cell of 01_setup.ipynb to confirm the connection, then click Check again."
+    ;;
+esac

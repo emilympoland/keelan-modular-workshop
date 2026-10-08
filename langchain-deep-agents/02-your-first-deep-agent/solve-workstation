@@ -1,0 +1,46 @@
+#!/bin/bash
+#
+# Solve — challenge 2 (your-first-deep-agent)
+#
+# This challenge has one genuinely blank cell (the create_deep_agent call), so
+# the learner's notebook cannot simply be executed: as shipped, the blanked
+# cell defines no agent. So the solve fills the blank
+# first, by cell TAG, writing a copy to /tmp — the learner's own notebook is
+# never modified. Executing that copy for real is still the only automated
+# proof that every other cell in the notebook runs, and that the filled cell
+# is a correct solution.
+#
+# Full-chain defensive: skipping is enabled, so this may run without challenge
+# 1 having been played. It seeds credentials first.
+#
+# Idempotent: re-running refills the blank and re-executes, overwriting the
+# same real output file.
+#
+# Adapted from the sibling track langchain-langgraph-langsmith-ext
+# (04-the-five-line-version), same fill-by-tag-then-execute-from-/tmp pattern.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+VENV_BIN="${WORKSHOP_DIR}/.venv/bin"
+
+# --- credentials, exactly as challenge 1's getpass cell would leave them ----- #
+"${VENV_BIN}/python" "${OPS_DIR}/seed_credentials.py"
+
+# --- fill the blanked cell -------------------------------------------------- #
+"${VENV_BIN}/python" "${OPS_DIR}/fill_challenge2_blank.py"
+
+# --- run the filled notebook ------------------------------------------------ #
+# Executed from /tmp, which is why this notebook's Setup cell uses an absolute
+# path rather than upstream's cwd-relative Path().resolve().parent: nbconvert
+# runs the kernel in the input notebook's own directory.
+cd /tmp
+timeout --kill-after=10 300 "${VENV_BIN}/jupyter" nbconvert \
+  --to notebook \
+  --execute \
+  --ExecutePreprocessor.timeout=180 \
+  --output-dir /tmp \
+  --output 02_your_first_deep_agent.executed.ipynb \
+  /tmp/02_your_first_deep_agent.solved.ipynb
+
+echo "solve: challenge 2 blank filled and notebook executed end to end"

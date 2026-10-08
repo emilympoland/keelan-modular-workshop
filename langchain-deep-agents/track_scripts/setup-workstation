@@ -1,0 +1,4656 @@
+#!/bin/bash
+#
+# Track-level setup — langchain-deep-agents-workshop-ext
+#
+# Provisions the workshop environment on the workstation VM:
+#   repo (pinned) + uv venv, Bedrock model wiring, setup notebook,
+#   JupyterLab behind nginx (systemd), Bedrock warm-up.
+#
+# The track provides NO LangSmith credentials: learners enter their
+# own in challenge 1. The only credential here is the per-sandbox AWS account
+# Instruqt provisions for Bedrock.
+#
+# Infra conventions lifted from the sibling track
+# langchain-langgraph-langsmith-ext (git branch adlc-101-slice-0). AgentCore
+# Web Search was tried and rejected as the section-3 web-search tool -- see
+# MEMORY.md, slice 0 verdict: blocked by an AWS Organizations SCP deny.
+#
+set -euxo pipefail
+PS4='+$0[$LINENO]+'
+
+echo "##################################################"
+echo "# running track_scripts/setup-workstation        #"
+echo "##################################################"
+
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export HOME=/root
+
+# The workshop tree lives in /opt/workshop, owned by the non-root 'workshop'
+# user that runs JupyterLab. /root/workshop is a compatibility symlink so every
+# path used by checks, solves, and notebooks keeps working.
+WORKSHOP_DIR=/opt/workshop
+WORKSHOP_USER=workshop
+INSTRUQT_DIR="${WORKSHOP_DIR}/instruqt"
+OPS_DIR=/opt/instruqt-workshop
+ENV_FILE=/etc/instruqt-workshop.env
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 1/10: waiting for host bootstrap + agent..."
+tries=0
+until [ -f /opt/instruqt/bootstrap/host-bootstrap-completed ]; do
+  tries=$((tries+1)); [ "$tries" -ge 300 ] && { echo "SETUP FAILED: bootstrap sentinel absent after 300s" >&2; exit 1; }
+  sleep 1
+done
+tries=0
+until ss -tuln 2>/dev/null | grep -q ':15779'; do
+  tries=$((tries+1)); [ "$tries" -ge 120 ] && { echo "SETUP FAILED: instruqt agent port 15779 not up after 120s" >&2; exit 1; }
+  sleep 1
+done
+echo "✅ Step 1/10 completed"
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 2/10: base packages..."
+wait_for_dpkg() {
+  local t=0
+  while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    t=$((t+1)); [ "$t" -ge 150 ] && { echo "SETUP FAILED: dpkg lock held >300s" >&2; exit 1; }
+    sleep 2
+  done
+}
+wait_for_dpkg
+apt-get update -qq
+wait_for_dpkg
+apt-get install -y -qq git jq curl unzip nginx
+touch /root/.hushlogin
+
+# Non-root service account for JupyterLab (no login shell, so Jupyter's
+# terminal feature is dead weight even if reached).
+id -u "$WORKSHOP_USER" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin "$WORKSHOP_USER"
+echo "✅ Step 2/10 completed"
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 3/10: per-sandbox identity + agent variables..."
+# The sandbox id is the uniqueness guarantee: Instruqt documents
+# INSTRUQT_PARTICIPANT_ID (which _SANDBOX_ID mirrors) as unique for every play.
+#
+# It is NOT attributable, though, which matters when a room shares one LangSmith
+# workspace. Instruqt's INSTRUQT_USER_NAME / INSTRUQT_USER_EMAIL would solve
+# that, but both are gated on the user having accepted the org's privacy policy
+# and team `langchain` has none configured -- a real playthrough on 2026-09-16
+# showed both EMPTY with PRIVACY_POLICY_CONSENT unset, so no track-side code can
+# reach them. The learner supplies their own label in challenge 1 instead, which
+# is also the only option that works for external customers. See MEMORY.md.
+SFX="$(echo "${_SANDBOX_ID:-localdev0}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-8)"
+[ -n "$SFX" ] || SFX="localdev"
+LS_PROJECT="${LANGSMITH_PROJECT_BASE:-instruqt-deep-agents}-${SFX}"
+
+agent variable set SFX "$SFX"
+agent variable set LS_PROJECT "$LS_PROJECT"
+echo "✅ Step 3/10 completed (suffix: ${SFX})"
+
+echo "⏳ Step 4/10: clone modular-workshops @ pinned commit..."
+# Pinned to WORKSHOP_COMMIT (config.yml) so upstream changes never break a
+# workshop that is already running.
+rm -rf "$WORKSHOP_DIR"
+mkdir -p "$WORKSHOP_DIR"
+cd "$WORKSHOP_DIR"
+git init -q
+git remote add origin "${WORKSHOP_REPO}"
+tries=0
+until git fetch --depth 1 origin "${WORKSHOP_COMMIT}"; do
+  tries=$((tries+1)); [ "$tries" -ge 5 ] && { echo "SETUP FAILED: could not fetch pinned commit from GitHub" >&2; exit 1; }
+  sleep 5
+done
+git checkout -q FETCH_HEAD
+mkdir -p "${WORKSHOP_DIR}/output" "$INSTRUQT_DIR" "$OPS_DIR"
+# Compatibility symlink: /root/workshop → /opt/workshop
+[ -L /root/workshop ] || rm -rf /root/workshop
+ln -sfn "$WORKSHOP_DIR" /root/workshop
+# The non-root 'workshop' user (Jupyter kernels) must traverse /root to reach
+# that symlink. 711 allows traverse-by-known-name only — no directory listing,
+# and the sensitive files under /root (.aws/credentials, .ssh keys) stay 600
+# and unreadable.
+chmod 711 /root
+echo "✅ Step 4/10 completed"
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 5/10: uv + python environment (uv sync)..."
+# The pinned commit's pyproject.toml already carries every dependency this
+# track needs (langgraph, langgraph-checkpoint-sqlite, langgraph-cli, jupyter,
+# langchain-aws, tavily-python, python-dotenv, and -- as the default `harbor`
+# dependency group -- challenge 13's harbor CLI), so a plain `uv sync` is
+# sufficient — no supplementary installs that could drift from upstream.
+if ! command -v uv >/dev/null 2>&1 && [ ! -x /root/.local/bin/uv ]; then
+  tries=0
+  until curl -LsSf https://astral.sh/uv/install.sh | sh; do
+    tries=$((tries+1)); [ "$tries" -ge 3 ] && { echo "SETUP FAILED: uv install failed 3x" >&2; exit 1; }
+    sleep 5
+  done
+fi
+export PATH="/root/.local/bin:$PATH"
+cd "$WORKSHOP_DIR"
+tries=0
+until uv sync; do
+  tries=$((tries+1)); [ "$tries" -ge 3 ] && { echo "SETUP FAILED: uv sync failed 3x" >&2; exit 1; }
+  sleep 10
+done
+VENV_PY="${WORKSHOP_DIR}/.venv/bin/python"
+echo "✅ Step 5/10 completed"
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 6/10: credentials + environment files..."
+# Secrets go into files, never into the xtrace log -- so xtrace goes off before
+# the key and secret are even read into variables, or every assignment below
+# would print them.
+set +x
+# Resolve Bedrock AWS creds; fall back to any injected AWS-account prefix.
+BEDROCK_AWS_KEY="${INSTRUQT_AWS_ACCOUNT_BEDROCK_AWS_ACCESS_KEY_ID:-}"
+BEDROCK_AWS_SECRET="${INSTRUQT_AWS_ACCOUNT_BEDROCK_AWS_SECRET_ACCESS_KEY:-}"
+if [ -z "$BEDROCK_AWS_KEY" ]; then
+  key_var="$(env | grep -oE '^INSTRUQT_AWS_ACCOUNT_[A-Z0-9_]+_AWS_ACCESS_KEY_ID' | head -n1 || true)"
+  if [ -n "$key_var" ]; then
+    secret_var="${key_var%_AWS_ACCESS_KEY_ID}_AWS_SECRET_ACCESS_KEY"
+    BEDROCK_AWS_KEY="${!key_var}"
+    BEDROCK_AWS_SECRET="${!secret_var}"
+  fi
+fi
+[ -n "$BEDROCK_AWS_KEY" ] || { echo "SETUP FAILED: no injected AWS credentials found for Bedrock" >&2; exit 1; }
+# No LangSmith key is expected here: the learner supplies their own in
+# challenge 1, and the getpass cell appends them to the .env written below.
+
+mkdir -p /root/.aws
+cat > /root/.aws/credentials <<AWSEOF
+[default]
+aws_access_key_id = ${BEDROCK_AWS_KEY}
+aws_secret_access_key = ${BEDROCK_AWS_SECRET}
+AWSEOF
+cat > /root/.aws/config <<AWSCFGEOF
+[default]
+region = ${BEDROCK_REGION}
+AWSCFGEOF
+chmod 600 /root/.aws/credentials
+
+# Workshop .env — loaded by utils/models.py (dotenv) and every notebook.
+#
+# Ships WITHOUT a LangSmith key: the learner adds it in challenge 1
+# and the getpass cell rewrites this file in place. Tracing starts off, so the
+# tracer doesn't emit errors against a key that doesn't exist yet; the same cell
+# flips it on once a key has authenticated.
+#
+# No LANGSMITH_WORKSPACE_ID either — the learner's key belongs to their own
+# workspace, and scoping clients to ours would make every call forbidden.
+cat > "${WORKSHOP_DIR}/.env" <<DOTENVEOF
+LANGSMITH_TRACING=false
+LANGSMITH_PROJECT=${LS_PROJECT}
+WORKSHOP_SFX=${SFX}
+WORKSHOP_PROJECT_BASE=${LANGSMITH_PROJECT_BASE:-instruqt-deep-agents}
+AWS_ACCESS_KEY_ID=${BEDROCK_AWS_KEY}
+AWS_SECRET_ACCESS_KEY=${BEDROCK_AWS_SECRET}
+AWS_DEFAULT_REGION=${BEDROCK_REGION}
+BEDROCK_MODEL_SONNET=${BEDROCK_MODEL_SONNET}
+BEDROCK_MODEL_HAIKU=${BEDROCK_MODEL_HAIKU}
+DOTENVEOF
+chmod 600 "${WORKSHOP_DIR}/.env"
+
+# Same content for systemd services + interactive shells.
+cp "${WORKSHOP_DIR}/.env" "$ENV_FILE"
+# Per-sandbox JupyterLab token (ENV_FILE only — not in the learner-visible
+# .env). nginx injects it for tab traffic; Jupyter refuses anything without it.
+JUPYTER_TOKEN="$(openssl rand -hex 24)"
+echo "JUPYTER_TOKEN=${JUPYTER_TOKEN}" >> "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+cat >> /root/.bashrc <<'BASHRCEOF'
+set -a; [ -f /etc/instruqt-workshop.env ] && . /etc/instruqt-workshop.env; set +a
+export PATH="/root/.local/bin:/root/workshop/.venv/bin:$PATH"
+BASHRCEOF
+set -x
+
+echo "✅ Step 6/10 completed"
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 7/10: point utils/models.py at Bedrock..."
+# Deterministic overwrite (not sed) — same public interface: `model`.
+# This is also what resolves the import-time credential problem: the module
+# that reads the environment is replaced wholesale.
+cat > "${WORKSHOP_DIR}/utils/models.py" <<'MODELSEOF'
+"""Centralized model initialization (Instruqt build).
+
+The notebooks all import `model` from here. This build runs on AWS Bedrock
+using the sandbox's ephemeral AWS credentials — the documented one-line
+provider swap from the upstream repo, applied.
+"""
+
+import os
+from dotenv import load_dotenv
+load_dotenv(dotenv_path="../.env", override=True)
+load_dotenv(dotenv_path="/root/workshop/.env", override=False)
+
+from langchain_aws import ChatBedrockConverse
+
+_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+# Agent model — Claude Sonnet via Bedrock cross-region inference.
+model = ChatBedrockConverse(
+    provider="anthropic",
+    model_id=os.environ.get("BEDROCK_MODEL_SONNET", "us.anthropic.claude-sonnet-4-6"),
+    region_name=_REGION,
+)
+
+# Judge model — Claude Haiku, for fast/cheap evaluation work.
+judge_model = ChatBedrockConverse(
+    provider="anthropic",
+    model_id=os.environ.get("BEDROCK_MODEL_HAIKU", "us.anthropic.claude-haiku-4-5-20251001-v1:0"),
+    region_name=_REGION,
+)
+
+# Same agent model as data, for challenge 13's Harbor job: the trial container
+# can't import this file, so the spec travels through Harbor's config channel
+# (upstream's MODEL_SPEC / API_KEY_ENV interface). Bedrock authenticates from
+# the AWS credential chain, so there's no single key variable.
+MODEL_SPEC = {
+    "model": "bedrock_converse:" + os.environ.get("BEDROCK_MODEL_SONNET", "us.anthropic.claude-sonnet-4-6"),
+    "region_name": _REGION,
+}
+API_KEY_ENV = None
+
+# Without a LangSmith key there are no traces for the challenge Checks to read,
+# so record each run to local disk instead -- the same tree LangSmith would hold
+# (tool and model inputs/outputs), one JSON file per invoke(). With a key this
+# block does nothing and LangSmith stays the only record.
+if not os.environ.get("LANGSMITH_API_KEY"):
+    import json
+    from contextvars import ContextVar
+    from pathlib import Path
+
+    from langchain_core.tracers.base import BaseTracer
+    from langchain_core.tracers.context import register_configure_hook
+
+    _TRACE_DIR = Path("/var/lib/lab-traces")
+
+    def _flatten(run, out):
+        out.append({
+            "id": str(run.id), "trace_id": str(run.trace_id),
+            "parent_run_id": str(run.parent_run_id) if run.parent_run_id else None,
+            "name": run.name, "run_type": run.run_type,
+            "start_time": run.start_time.isoformat(),
+            "inputs": run.inputs, "outputs": run.outputs, "error": run.error,
+        })
+        for child in run.child_runs:
+            _flatten(child, out)
+        return out
+
+    class _LocalTraceRecorder(BaseTracer):
+        def _persist_run(self, run):
+            path = _TRACE_DIR / f"{run.id}.json"
+            path.write_text(json.dumps(_flatten(run, []), default=str))
+
+    register_configure_hook(ContextVar("lab_local_tracer", default=None), True,
+                            _LocalTraceRecorder, "LAB_LOCAL_TRACES")
+    os.environ["LAB_LOCAL_TRACES"] = "true"
+MODELSEOF
+# Challenge 13's Harbor trial container installs its own dependencies from this
+# file, and upstream lists only langchain-openai. The track's MODEL_SPEC is
+# bedrock_converse, so the container needs langchain-aws too.
+"$VENV_PY" - <<'LGJSONEOF'
+import json
+from pathlib import Path
+
+p = Path("/opt/workshop/environment_evals/deep-agent/langgraph.json")
+cfg = json.loads(p.read_text())
+if not any(d.startswith("langchain-aws") for d in cfg["dependencies"]):
+    cfg["dependencies"].append("langchain-aws>=1.6")
+p.write_text(json.dumps(cfg, indent=2) + "\n")
+LGJSONEOF
+
+# ---- web search: LangSmith's managed Parallel search ----
+# The same server Managed Deep Agents projects add with define_mcp(...)
+# (docs.langchain.com/langsmith/python/managed-deep-agents-search), called
+# directly over MCP's HTTP transport with the learner's own LangSmith key, since
+# these agents run in notebooks rather than as a managed project. Confirmed
+# working outside a managed project on 2026-10-07: x-api-key + X-Tenant-Id
+# headers, one tool, `parallel_web_search(objective, search_queries)`.
+#
+# Replaces Tavily, so learners need no search key at all. Keeps upstream's
+# resilience contract: retries, then upstream's topic-matched canned fallback
+# (reused from utils/search.py) under the same "[fallback content; ...]" marker.
+cat > "${WORKSHOP_DIR}/utils/parallel_search.py" <<'PSEARCHEOF'
+"""Web search through LangSmith's managed Parallel search, with retries and a
+canned fallback.
+
+Usage, from inside your own `@tool` (same shape as upstream's Tavily helper):
+
+    from utils.parallel_search import resilient_parallel_search
+
+    @tool(parse_docstring=True)
+    def web_search(query: str) -> str:
+        \"\"\"Search the web for information on a given query.
+
+        Args:
+            query: Search query to execute.
+        \"\"\"
+        return resilient_parallel_search(query, max_retries=2)
+
+Authenticates with LANGSMITH_API_KEY; no Parallel key. Without a LangSmith key,
+or if every attempt fails, returns canned results so the agent can still answer.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from typing import Optional
+
+import requests
+
+from utils.search import _pick_fallback
+
+_PATH = "/v1/managed-tools/servers/parallel/mcp"
+_TOOL = "parallel_web_search"
+_PROTOCOL = "2025-06-18"
+
+_lock = threading.Lock()
+_session_id: Optional[str] = None
+_workspace_id: Optional[str] = None
+
+
+def _url() -> str:
+    base = os.environ.get("LANGSMITH_ENDPOINT") or "https://api.smith.langchain.com"
+    return base.rstrip("/") + _PATH
+
+
+def _workspace() -> Optional[str]:
+    """The key's workspace ID, looked up once. The server reads it from X-Tenant-Id."""
+    global _workspace_id
+    if _workspace_id is None:
+        _workspace_id = os.environ.get("LANGSMITH_WORKSPACE_ID", "")
+        if not _workspace_id:
+            from langsmith import Client
+
+            project = next(iter(Client().list_projects(limit=1)), None)
+            _workspace_id = str(project.tenant_id) if project else ""
+    return _workspace_id or None
+
+
+def _post(payload: dict, session: Optional[str] = None) -> requests.Response:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "x-api-key": os.environ["LANGSMITH_API_KEY"],
+    }
+    workspace = _workspace()
+    if workspace:
+        headers["X-Tenant-Id"] = workspace
+    if session:
+        headers["Mcp-Session-Id"] = session
+    resp = requests.post(_url(), json=payload, headers=headers, timeout=60)
+    resp.raise_for_status()
+    return resp
+
+
+def _message(resp: requests.Response) -> dict:
+    """A JSON-RPC message from a plain JSON body or an SSE `data:` stream."""
+    body = resp.text
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            body = line[5:].strip()
+    return json.loads(body)
+
+
+def _session() -> str:
+    """Open the MCP session once per process; reused across calls and threads."""
+    global _session_id
+    with _lock:
+        if _session_id is None:
+            resp = _post({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": _PROTOCOL, "capabilities": {},
+                           "clientInfo": {"name": "instruqt-workshop", "version": "1"}},
+            })
+            sid = resp.headers.get("Mcp-Session-Id")
+            _post({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+            _session_id = sid or ""
+        return _session_id
+
+
+def _reset_session() -> None:
+    global _session_id
+    with _lock:
+        _session_id = None
+
+
+def _search(query: str, max_results: int) -> str:
+    msg = _message(_post({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": _TOOL,
+                   "arguments": {"objective": query, "search_queries": [query]}},
+    }, _session() or None))
+    if "error" in msg:
+        raise RuntimeError(msg["error"].get("message", "MCP error"))
+    result = msg["result"]
+    text = "".join(c.get("text", "") for c in result.get("content", []) if c.get("type") == "text")
+    if result.get("isError"):
+        raise RuntimeError(text[:200] or "search failed")
+
+    try:
+        hits = json.loads(text).get("results", [])
+    except ValueError:
+        return text[:6000]
+    if not hits:
+        raise RuntimeError("Parallel returned 0 results")
+    # Same layout as upstream's Tavily helper: **title**, url, content.
+    return "\n\n".join(
+        f"**{h.get('title') or h.get('url', '')}**\n{h.get('url', '')}\n"
+        + "\n".join(h.get("excerpts") or [])[:1500]
+        for h in hits[:max_results]
+    )
+
+
+def resilient_parallel_search(
+    query: str,
+    *,
+    max_retries: int = 2,
+    max_results: int = 5,
+    base_backoff_seconds: float = 1.0,
+) -> str:
+    """Run a Parallel web search with retries; fall back to canned content on failure.
+
+    Args:
+        query: search query to run (also sent as the search objective).
+        max_retries: additional attempts after the first call.
+        max_results: how many results to return.
+        base_backoff_seconds: first retry sleeps this long; then `base * attempt`.
+    """
+    if not os.environ.get("LANGSMITH_API_KEY"):
+        last_error: Exception = RuntimeError("no LangSmith key")
+    else:
+        for attempt in range(max_retries + 1):
+            try:
+                return _search(query, max_results)
+            except Exception as exc:
+                last_error = exc
+                _reset_session()
+                if attempt < max_retries:
+                    time.sleep(base_backoff_seconds * (attempt + 1))
+
+    notice = (
+        f"[fallback content; live search unavailable -- "
+        f"{type(last_error).__name__}: {str(last_error)[:120]}]\n\n"
+    )
+    return notice + _pick_fallback(query)
+PSEARCHEOF
+
+# Point upstream's two shared agents at the same search, so challenges 9, 11,
+# 12 and 14 match 3-7. deep_agent names its tool parallel_search, not
+# web_search: it already has a local variable called web_search.
+"$VENV_PY" - <<'AGENTSEARCHEOF'
+from pathlib import Path
+
+def patch(path, pairs):
+    p = Path(path)
+    s = p.read_text()
+    for old, new in pairs:
+        if old not in s:
+            raise SystemExit(f"SETUP FAILED: {path} no longer contains {old!r}")
+        s = s.replace(old, new)
+    p.write_text(s)
+
+patch("/opt/workshop/agents/research_agent.py", [
+    ("from utils.search import resilient_tavily_search",
+     "from utils.parallel_search import resilient_parallel_search"),
+    ("resilient_tavily_search(query, max_retries=2)",
+     "resilient_parallel_search(query, max_retries=2)"),
+    ("`resilient_tavily_search` retries on Tavily failure",
+     "`resilient_parallel_search` retries on failure"),
+    ("tavily_search", "web_search"),
+])
+patch("/opt/workshop/agents/deep_agent/agent.py", [
+    ("from utils.search import resilient_tavily_search",
+     "from utils.parallel_search import resilient_parallel_search"),
+    ("resilient_tavily_search(query, max_retries=2)",
+     "resilient_parallel_search(query, max_retries=2)"),
+    ("def tavily_search(", "def parallel_search("),
+    ("else tavily_search", "else parallel_search"),
+])
+print("agents now search through LangSmith's managed Parallel search")
+AGENTSEARCHEOF
+
+# World-writable + sticky, like /tmp: the Jupyter kernel (workshop user) and
+# the solve scripts (root) both write here; the Checks (root) read.
+mkdir -p /var/lib/lab-traces
+chmod 1777 /var/lib/lab-traces
+# ---- Bedrock credential preflight --------------------------------- #
+# Runs after models.py is rewritten above: before that, utils/models.py is
+# upstream's OpenAI wiring and this always failed.
+# The model is the only credential the TRACK provides, so it is the only one
+# that can be validated here. The learner's LangSmith key is
+# validated at the moment they are entered, in the challenge-1 notebook cell.
+cat > "${OPS_DIR}/preflight_bedrock.py" <<'PREEOF'
+"""Fail fast if the sandbox's injected AWS credentials cannot reach Bedrock."""
+import os, sys
+from dotenv import load_dotenv
+load_dotenv("/root/workshop/.env", override=True)
+sys.path.insert(0, "/root/workshop")
+
+try:
+    from utils.models import model
+    model.invoke("Reply with the single word: ready")
+except Exception as exc:
+    print("SETUP FAILED: Bedrock credential preflight", file=sys.stderr)
+    print("  The sandbox's AWS credentials could not invoke the model.", file=sys.stderr)
+    print(f"  region: {os.environ.get('AWS_DEFAULT_REGION')}", file=sys.stderr)
+    print(f"  model:  {os.environ.get('BEDROCK_MODEL_SONNET')}", file=sys.stderr)
+    print(f"  API said: {str(exc)[:200]}", file=sys.stderr)
+    sys.exit(1)
+print("\u2713 preflight OK \u2014 Bedrock reachable with the sandbox's AWS credentials")
+PREEOF
+# Guarded: Bedrock model access can take minutes to finish enabling in a fresh
+# sandbox, so a failure here is reported by the warm-up retry loop in step 10
+# rather than killing setup on the first attempt.
+"$VENV_PY" "${OPS_DIR}/preflight_bedrock.py" || echo "preflight: Bedrock not ready yet — step 10 retries with backoff"
+echo "✅ Step 7/10 completed"
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 8/10: workshop content (verify script, orientation notebook)..."
+
+# ---- verify-connection (challenge 1) ----
+# Reads whatever key the learner stored via the notebook's getpass cell.
+# Prints NO part of the key — the PRD forbids any secret value, even a prefix,
+# in learner-facing output.
+cat > "${OPS_DIR}/verify_connection.py" <<'VERIFYEOF'
+"""Challenge 1 — verify the LangSmith connection, live."""
+import os, sys
+from dotenv import load_dotenv
+load_dotenv("/root/workshop/.env", override=True)
+from langsmith import Client
+
+ACCENT = "\033[38;2;127;200;255m"; OK = "\033[38;2;2;122;72m"
+ERR = "\033[38;2;180;35;24m"; RST = "\033[0m"
+
+def fail(msg):
+    print(f"{ERR}✗ {msg}{RST}"); sys.exit(1)
+
+def done():
+    with open("/tmp/.verify-connection-ok", "w") as f:
+        f.write("ok\n")
+    # Mode 666: this runs as root, but the same sentinel may later be rewritten
+    # by the non-root account that runs the Jupyter kernel.
+    os.chmod("/tmp/.verify-connection-ok", 0o666)
+
+print(f"{ACCENT}── LangSmith connection check ─────────────────────{RST}")
+key = os.environ.get("LANGSMITH_API_KEY", "")
+if not key:
+    if not os.path.exists("/tmp/.credentials-ok"):
+        fail("No keys entered yet. Run the first cell of 01_setup.ipynb on the Notebook tab.")
+    print("• No LangSmith key: tracing is off, so there is no connection to check.")
+    print("  Every Challenge and Check still works without it.")
+    done()
+    sys.exit(0)
+if not key.startswith("lsv2_"):
+    fail("The stored LANGSMITH_API_KEY is malformed — LangSmith keys start with 'lsv2_'.")
+print(f"{OK}✓{RST} API key present (value masked)")
+
+ENDPOINT = os.environ.get("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+REGION = {
+    "https://api.smith.langchain.com": "US",
+    "https://eu.api.smith.langchain.com": "EU",
+    "https://apac.api.smith.langchain.com": "APAC",
+    "https://aws.api.smith.langchain.com": "AWS US",
+}.get(ENDPOINT, "custom")
+
+# An AUTHENTICATED call. Client().info is not one -- /info answers 200 for any
+# key at all, so the old check here passed for a garbage key and for a valid key
+# pointed at the wrong region.
+try:
+    import itertools
+    list(itertools.islice(Client().list_projects(), 1))
+except Exception:
+    # Never print the exception body: a rejected-credential error can echo the
+    # submitted value back.
+    fail(f"LangSmith rejected the stored key against the {REGION} region "
+         f"({ENDPOINT}). Re-run the first notebook cell to enter it again.")
+print(f"{OK}✓{RST} {ENDPOINT.replace('https://','')} authenticated ({REGION} region)")
+
+print(f"{OK}✓{RST} tracing project: {os.environ.get('LANGSMITH_PROJECT', '')}")
+print(f"{OK}✓{RST} tracing enabled: {os.environ.get('LANGSMITH_TRACING')}")
+print(f"{ACCENT}───────────────────────────────────────────────────{RST}")
+print("Connected. Every agent you build in this track traces into that")
+print("project in your own LangSmith workspace.")
+done()
+VERIFYEOF
+cat > /usr/local/bin/verify-connection <<'WRAPEOF'
+#!/bin/bash
+cd /root/workshop && exec .venv/bin/python /opt/instruqt-workshop/verify_connection.py "$@"
+WRAPEOF
+chmod +x /usr/local/bin/verify-connection
+
+# ---- orientation notebook (challenge 1) ----
+# Slice 0 carries no LangGraph teaching content. This notebook collects the
+# learner's own credentials, then proves the path end to end: Jupyter serves,
+# the kernel starts in the workshop venv, Bedrock answers, and the call traces.
+
+cat > "${INSTRUQT_DIR}/lab_state.py" <<'STATEEOF'
+"""Tiny helper: record that a notebook cell really ran, for the challenge Check."""
+
+import os
+from pathlib import Path
+
+
+def mark_done(path):
+    """Write a sentinel the Check reads, tolerating one root already left there."""
+    p = Path(path)
+    try:
+        p.write_text("ok\n")
+    except PermissionError:
+        # Skipping a challenge runs its solve as root, which creates these
+        # files; /tmp is sticky so we cannot replace one we do not own. If it
+        # is already present with content, the Check is satisfied either way.
+        if not (p.exists() and p.read_text().strip()):
+            raise
+        return
+    try:
+        os.chmod(p, 0o666)  # let root-side scripts rewrite it later
+    except OSError:
+        pass
+
+STATEEOF
+
+cat > "${INSTRUQT_DIR}/lab_credentials.py" <<'CREDEOF'
+"""Collect the learner's LangSmith key in Challenge 1 and store it in .env.
+
+Plumbing, deliberately kept out of the notebook: nobody is here to learn
+getpass. The notebook cell is just `from lab_credentials import collect`.
+"""
+
+import getpass
+import os
+import re
+import unicodedata
+from pathlib import Path
+
+from lab_state import mark_done
+
+ENV = Path("/root/workshop/.env")
+
+# LangSmith is regional and a key is only valid in its own region. The region is
+# NOT encoded in the key -- `lsv2_sk_` vs `lsv2_pt_` is service-key vs personal
+# token, not US vs EU -- so the only way to know is to ask each region in turn.
+REGIONS = [
+    ("US", "https://api.smith.langchain.com"),
+    ("EU", "https://eu.api.smith.langchain.com"),
+    ("APAC", "https://apac.api.smith.langchain.com"),
+    ("AWS US", "https://aws.api.smith.langchain.com"),
+]
+
+
+def _detect_region(api_key):
+    """First region where the key really authenticates, as (label, endpoint).
+
+    Uses list_projects rather than Client().info: /info is UNAUTHENTICATED and
+    returns 200 for any key at all, including a garbage one, so it cannot tell
+    a good key from a bad one, or the right region from the wrong one.
+    """
+    import itertools
+
+    from langsmith import Client
+
+    for label, url in REGIONS:
+        try:
+            client = Client(api_key=api_key, api_url=url)
+            list(itertools.islice(client.list_projects(), 1))
+        except Exception:
+            # Never inspect or print the body: a rejected-credential response
+            # can echo the submitted key back, and notebook output is saved to
+            # disk. Failures here are the ordinary wrong-region path.
+            continue
+        return label, url
+    return None, None
+
+
+def _slugify(text):
+    """Strip accents and punctuation so a label is safe inside a project name."""
+    plain = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", "", plain.lower())[:20]
+
+
+def _store(updates, remove=()):
+    """Rewrite .env in place at 0600, preserving every unrelated line."""
+    lines = ENV.read_text().splitlines() if ENV.exists() else []
+    drop = set(updates) | set(remove)
+    kept = [l for l in lines if l.split("=", 1)[0] not in drop]
+    body = "\n".join(kept + [f"{k}={v}" for k, v in updates.items()]) + "\n"
+    fd = os.open(str(ENV), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(body)
+    # The mode above only applies when the file is CREATED. .env already exists
+    # (setup writes it), so without this an earlier bad mode would survive every
+    # rewrite. Enforce it on the file we just wrote.
+    os.chmod(str(ENV), 0o600)
+
+
+def _project_name(label):
+    sfx = os.environ.get("WORKSHOP_SFX", "")
+    base = os.environ.get("WORKSHOP_PROJECT_BASE", "instruqt-deep-agents")
+    if label and sfx:
+        return f"{base}-{label}-{sfx}"
+    if sfx:
+        return f"{base}-{sfx}"
+    return os.environ["LANGSMITH_PROJECT"]
+
+
+def collect():
+    """Prompt for keys, verify the LangSmith one live, and switch tracing on."""
+    ls_key = getpass.getpass(
+        "LangSmith API key (input hidden, or press Enter to skip): "
+    ).strip()
+    if not ls_key:
+        # No LangSmith: tracing off, and any key from an earlier run removed so
+        # every later notebook and Check agrees on which mode this sandbox is in.
+        remove = ["LANGSMITH_API_KEY", "LANGSMITH_ENDPOINT"]
+        updates = {"LANGSMITH_TRACING": "false"}
+        _store(updates, remove)
+        for k in remove:
+            os.environ.pop(k, None)
+        os.environ["LANGSMITH_TRACING"] = "false"
+        mark_done("/tmp/.credentials-ok")
+        print("✅ Stored. LangSmith skipped: tracing is OFF and no trace links are printed.")
+        print("   web search returns canned results without a LangSmith key.")
+        return
+    if not ls_key.startswith("lsv2_"):
+        raise SystemExit(
+            "That doesn't look like a LangSmith key - they start with 'lsv2_'. "
+            "Re-run this cell."
+        )
+
+    os.environ["LANGSMITH_API_KEY"] = ls_key
+
+    print("Checking your key against each LangSmith region...")
+    region, endpoint = _detect_region(ls_key)
+    if endpoint is None:
+        raise SystemExit(
+            "That key did not authenticate in any LangSmith region "
+            "(US, EU, APAC, AWS US). Check it and re-run this cell."
+        )
+
+    # Every LangSmith client in this track is a bare Client(), which reads this
+    # variable from the environment -- so storing it here is what points the
+    # tracer, verify-connection and all six Checks at your region.
+    updates = {
+        "LANGSMITH_API_KEY": ls_key,
+        "LANGSMITH_TRACING": "true",
+        "LANGSMITH_ENDPOINT": endpoint,
+    }
+
+    remove = []
+
+    # Not a secret, so unlike the keys above this one is echoed as it is typed.
+    label = _slugify(input("Short name or initials for your project (e.g. jdoe): "))
+    project = _project_name(label)
+    updates["LANGSMITH_PROJECT"] = project
+
+    _store(updates, remove)
+    os.environ["LANGSMITH_TRACING"] = "true"
+    # The kernel started before this project name existed, so set it explicitly
+    # -- every trace from here on reads the name from the environment.
+    os.environ["LANGSMITH_PROJECT"] = project
+    os.environ["LANGSMITH_ENDPOINT"] = endpoint
+    mark_done("/tmp/.credentials-ok")
+
+    print("✅ Key verified and stored. Tracing is ON.")
+    print("   region :", region)
+    print("   project:", project)
+    if not label:
+        print("   (no label given, so your project is named after this session)")
+CREDEOF
+
+# ---- trace-link helper shared by the notebooks ----
+# Plumbing extracted from the notebooks (PRD 2026-09-22, "hide plumbing, never
+# hide curriculum"): the region->UI-host mapping and the tracer flush are not
+# what anyone is here to learn, and they were being restated in every notebook
+# that printed a project link.
+cat > "${INSTRUQT_DIR}/lab_trace.py" <<'TRACEEOF'
+"""Print the link to this sandbox's LangSmith project, and what to open there."""
+
+import os
+
+from langchain_core.tracers.langchain import wait_for_all_tracers
+from langsmith import Client
+
+
+def project_link(run_name=None, expand=None):
+    """Print the project URL. Name a run to say which one to open."""
+    if not os.environ.get("LANGSMITH_API_KEY"):
+        return  # no LangSmith key: tracing is off, so there is no link
+    # Push any queued spans before we go looking for them. NOTE this flushes the
+    # client queue; it is not a read-after-write barrier -- LangSmith is still
+    # eventually consistent, which is why the Checks retry.
+    wait_for_all_tracers()
+
+    # The UI host mirrors the API host for your region -- api.smith -> smith,
+    # eu.api.smith -> eu.smith, and so on. Dropping "api." is the whole mapping.
+    # `or` rather than a get() default: the variable is always PRESENT in the
+    # sandbox, and is empty for a US-region key, which a default never catches.
+    api = os.environ.get("LANGSMITH_ENDPOINT") or "https://api.smith.langchain.com"
+    ui = api.replace("api.smith", "smith")
+    project = os.environ["LANGSMITH_PROJECT"]
+
+    try:
+        p = Client().read_project(project_name=project)
+        print("Your traces:")
+        print(f"  {ui}/o/{p.tenant_id}/projects/p/{p.id}")
+    except Exception:
+        # Never print the error body: a credential failure can echo the key back.
+        print(f"Open {ui} and choose project:", project)
+
+    if run_name:
+        print()
+        print(f"Open '{run_name}'" + (f" and expand '{expand}'." if expand else "."))
+
+
+def trace_link(run_id):
+    """Print the URL of one trace. Pass the run_id given to invoke() in config."""
+    if not os.environ.get("LANGSMITH_API_KEY"):
+        return  # no LangSmith key: tracing is off, so there is no link
+    wait_for_all_tracers()
+
+    api = os.environ.get("LANGSMITH_ENDPOINT") or "https://api.smith.langchain.com"
+    ui = api.replace("api.smith", "smith")
+    project = os.environ["LANGSMITH_PROJECT"]
+
+    try:
+        p = Client().read_project(project_name=project)
+        # ?poll=true: the page waits for the trace if it hasn't landed yet.
+        print(f"\nView the trace: {ui}/o/{p.tenant_id}/projects/p/{p.id}/r/{run_id}?poll=true")
+    except Exception:
+        # Never print the error body: a credential failure can echo the key back.
+        print(f"\nOpen {ui} and choose project:", project)
+TRACEEOF
+
+cat > "${OPS_DIR}/gen_notebooks.py" <<'GENEOF'
+"""Generate the track's notebooks (stdlib JSON — a notebook is just JSON)."""
+import json, os
+
+OUT = "/opt/workshop/instruqt"
+
+def md(src): return {"cell_type": "markdown", "metadata": {}, "source": src.splitlines(keepends=True)}
+def code(src, tags=None):
+    # `tags` labels a cell so a solve script can find and fill it. Only
+    # challenge 4's blanked cell uses it; every other cell is untagged.
+    meta = {"tags": list(tags)} if tags else {}
+    return {"cell_type": "code", "execution_count": None, "metadata": meta, "outputs": [], "source": src.splitlines(keepends=True)}
+
+def write(name, cells):
+    nb = {
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {"display_name": "Python 3 (workshop)", "language": "python", "name": "python3"},
+            "language_info": {"name": "python", "version": "3.12"},
+        },
+        "nbformat": 4, "nbformat_minor": 5,
+    }
+    with open(os.path.join(OUT, name), "w") as f:
+        json.dump(nb, f, indent=1)
+    print("wrote", name)
+
+write("01_setup.ipynb", [
+md("""# Setup: connect your accounts 🦜
+
+Run the cells below in order: click a cell, then press `Shift+Enter`."""),
+md("""## 1. Enter your LangSmith API key
+
+[LangSmith API key](https://docs.langchain.com/langsmith/create-account-api-key):
+sends every agent run to your own LangSmith project, with a trace link after
+each run. Web search (from Challenge 3) also runs through LangSmith, with
+Parallel. Challenges 8, 10, 11, 12 and 14 require it.
+
+Press Enter to skip it. Without it, tracing is off, no links are printed, and
+web search returns canned results."""),
+code("""from lab_credentials import collect
+
+collect()"""),
+md("""## 2. Check your configuration
+
+Confirms LangSmith tracing and the model. The model runs on
+Amazon Bedrock with sandbox credentials, so it needs no key."""),
+code("""import os
+from dotenv import load_dotenv
+
+load_dotenv("/root/workshop/.env", override=True)
+
+print("tracing enabled :", os.environ["LANGSMITH_TRACING"])
+print("tracing project :", os.environ["LANGSMITH_PROJECT"])
+print("langsmith host  :", os.environ.get("LANGSMITH_ENDPOINT", "").replace("https://", "") or "US (default)")
+print("model           :", os.environ["BEDROCK_MODEL_SONNET"])
+print("aws region      :", os.environ["AWS_DEFAULT_REGION"])
+print("langsmith key   :", "present (masked)" if os.environ.get("LANGSMITH_API_KEY") else "not set (tracing off)")
+print("web search      :", "Parallel, through LangSmith" if os.environ.get("LANGSMITH_API_KEY") else "canned results (no LangSmith key)")"""),
+md("""## 3. Call the model
+
+Sends one prompt to Claude on Amazon Bedrock. With a LangSmith key, the call
+is traced to your LangSmith project.
+
+💡 The first call in a new sandbox can fail while AWS finishes enabling model
+access. Run the cell again."""),
+code("""import sys
+from pathlib import Path
+
+from lab_state import mark_done
+
+project_root = Path("/root/workshop")
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+mark_done("/tmp/.setup-kernel-ok")
+
+from utils.models import model   # Claude Sonnet on Bedrock
+
+response = model.invoke("In one short sentence: what is a deep agent?")
+print(response.text if hasattr(response, "text") else response.content)
+
+mark_done("/tmp/.setup-ok")
+print("\\n✅ Model call succeeded.")"""),
+md("""---
+## 4. Verify the LangSmith connection
+
+Re-checks your LangSmith key from a new process, which confirms it was saved
+to disk. Without a key, it confirms tracing is off."""),
+code("""import subprocess, sys
+
+subprocess.run(
+    [sys.executable, "/opt/instruqt-workshop/verify_connection.py"],
+    check=True,
+)"""),
+md("""---
+## 5. Next
+
+Confirm the cell above printed no ✗, then click **Check**."""),
+])
+# ---- challenge 2: Your First Deep Agent (upstream 1.1, mostly-verbatim curriculum cells) ----
+# ONE blanked cell (PRD-style convention, see the sibling track's challenge 4):
+# the learner pastes in the create_deep_agent call themselves, after first
+# watching plain create_agent() fail the same task. Everything else below is
+# modular-workshops/01_deep_agents.ipynb's real 1.1 content (fetched
+# 2026-09-30), unmodified except: (a) the Setup cell uses an ABSOLUTE path, not
+# upstream's cwd-relative Path().resolve().parent -- required because the solve
+# fills the blank into a /tmp copy and nbconvert runs the kernel in that copy's
+# own directory, same rationale as the sibling track's challenge 4; (b) one
+# Instruqt-added disk-extraction cell, clearly marked, placed right after the
+# same-thread re-read while `result` still holds that thread's state.
+write("02_your_first_deep_agent.ipynb", [
+md("""# Challenge 2 — Your First Deep Agent 🦜
+
+`create_agent()` is LangChain's plain agent builder — a model, tools, a loop.
+It has no filesystem, no planning, nothing extra. `create_deep_agent()` wraps
+the same model with a pre-built middleware stack that adds those for free.
+
+Run the cells below in order. **One cell is blank and yours to write.**"""),
+code("""import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from utils.models import model
+
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+from langsmith import uuid7
+from IPython.display import Image, display
+
+# Start each run with a clean long-term memory store (section 1.4 recreates it).
+for f in Path().glob("deep_agents_memory.db*"):
+    f.unlink()
+
+print("Ready")"""),
+md("""## Try the plain agent first
+
+`create_agent()` gives you a model in a loop — nothing else. Ask it to write a
+file, and it can only talk about writing one."""),
+code("""from langchain.agents import create_agent
+
+from lab_trace import trace_link
+
+agent = create_agent(
+    model=model,
+    system_prompt="You are a helpful assistant.",
+)
+
+run_id = uuid7()  # names this run's trace in LangSmith
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Write a haiku about AI to /haiku.txt, then read it back to me."}]
+}, config={"run_id": run_id})
+
+for m in result["messages"]:
+    m.model_copy(update={"content": m.text}).pretty_print()
+
+print("\\nfiles in result:", result.get("files"))
+trace_link(run_id)"""),
+md("""**Result:** the model replies in text, but prints `files in result: None`.
+`create_agent()` has only the tools you pass it, and this call passes none.
+Open the trace: one model call, no tool calls."""),
+md("""## 1.1 Your First Deep Agent
+
+`create_deep_agent()` gives you a filesystem, a todo list, and context management out of the box — no tools required.
+
+<img src="../images/deepAgentsDiag.png" style="width: auto; max-height: 420px; border-radius: 8px;">
+
+### What you get for free:
+
+- **Filesystem Tools** — `ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`
+- **Planning Tool** — `write_todos` for task tracking
+- **Subagent Delegation** — `task()` tool for isolated work
+- **Large Tool Result Eviction** — Automatically offloads tool results >20k tokens to the filesystem
+- **Conversation Summarization** — Compresses history when approaching ~85% context capacity
+- **Dangling Tool Call Patching** — Fixes message history consistency automatically"""),
+md("""Paste this into the cell below:
+
+```python
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model=model,
+    system_prompt="You are a helpful assistant.",
+    checkpointer=MemorySaver(),
+)
+agent
+```"""),
+code('''# ---------------------------------------------------------- YOUR TURN
+# Paste the create_deep_agent code from the instructions above.''',
+     tags=["instruqt-blank-first-deep-agent"]),
+code("""# The agent can already write and read files — these are built-in tools
+config = {"configurable": {"thread_id": str(uuid7())}}
+run_id = uuid7()
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Write a haiku about AI to /haiku.txt, then read it back to me."}]
+}, config={**config, "run_id": run_id})
+
+for m in result["messages"]:
+    m.model_copy(update={"content": m.text}).pretty_print()
+
+trace_link(run_id)"""),
+code("""# Helper: print the virtual filesystem from a deep agent result.
+def print_files(result, header="VIRTUAL FILESYSTEM (in-memory, not on disk!)"):
+    files = result.get("files") or {}
+    if not files:
+        print("(no files in state)")
+        return
+    print("=" * 50)
+    print(header)
+    print("=" * 50)
+    for path, file_data in files.items():
+        print(f"\\n  Path: {path!r}")
+        print("  " + "-" * 38)
+        content = file_data
+        if isinstance(file_data, dict) and "content" in file_data:
+            content = file_data["content"]
+        if isinstance(content, list):
+            content = "\\n".join(content)
+        for line in str(content).split("\\n"):
+            print(f"  | {line}")
+
+print_files(result)"""),
+md("""### Filesystem persistence within a thread
+
+By default, `create_deep_agent()` uses **StateBackend** — files are stored in agent state and persist within a thread (via the checkpointer), but disappear when you start a new thread.
+
+| Backend | Storage | Persistence | Use Case |
+|---------|---------|-------------|----------|
+| **StateBackend** | In-memory (agent state) | Single thread | Scratch pads, intermediate results |
+| **FilesystemBackend** | Local disk | Permanent | Direct file access (use with caution) |
+| **StoreBackend** | LangGraph Store | Cross-thread | Long-term memories |
+| **CompositeBackend** | Routes to others | Mixed | Selective persistence |"""),
+code("""# Same thread — the file persists via the checkpointer
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Read the file /haiku.txt"}]
+}, config=config)
+
+print("Same thread:\\n\\n", result["messages"][-1].text)"""),
+code("""# New thread — StateBackend is ephemeral, so the file is gone
+new_config = {"configurable": {"thread_id": str(uuid7())}}
+
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "List all files with ls /"}]
+}, config=new_config)
+
+print("New thread:", result["messages"][-1].text)"""),
+md("""### Key Takeaway
+- `create_deep_agent()` gives you filesystem + planning capabilities for free
+- Files are stored in agent state (virtual, not on disk)
+- `StateBackend` (default) persists within a thread but is ephemeral across threads
+- We'll see how to make files persist across threads with `CompositeBackend` + `StoreBackend` in section 1.4"""),
+md("""---
+## Next: Check
+
+Click **Check**. It finds the agent's `write_file` call to `/haiku.txt` in
+your traces (LangSmith, or the local trace log without a key)."""),
+])
+write("03_custom_tools_and_subagents.ipynb", [
+md("""# Challenge 3 — Custom Tools & Subagents 🦜
+
+Add your own tools alongside the built-in ones, then delegate work to a
+subagent that runs in its own isolated context. **One cell is blank and yours
+to write.**"""),
+code("""import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from utils.models import model
+from deepagents import create_deep_agent
+
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+from langsmith import uuid7
+from lab_trace import trace_link
+from IPython.display import Image, display
+
+print("Ready")"""),
+md("""## 1.2 Custom Tools
+
+Add your own tools alongside the built-in ones. We define `web_search` inline
+with `@tool` so the pattern stays visible. The body delegates to
+`resilient_parallel_search` from `utils/parallel_search.py`, which calls
+Parallel web search through LangSmith with your LangSmith key, retries on
+failure, and falls back to a canned response so the demo doesn't break on a
+flaky network."""),
+code("""from utils.parallel_search import resilient_parallel_search
+
+@tool(parse_docstring=True)
+def web_search(query: str) -> str:
+    \"\"\"Search the web for information on a given query.
+
+    Args:
+        query: Search query to execute.
+    \"\"\"
+    # `resilient_parallel_search` retries on failure and falls back to a
+    # topic-matched canned response. See utils/parallel_search.py.
+    return resilient_parallel_search(query, max_retries=2)
+
+print("tool:", web_search.name)"""),
+md("""## 1.3 Subagents: Isolated Delegation
+
+Subagents run in a separate context. The main agent delegates via `task()`
+and only sees the final result — keeping the main context clean."""),
+code('''from datetime import datetime
+
+research_subagent = {
+    "name": "research-agent",
+    "description": "Delegate research tasks. Give one topic at a time.",
+    "system_prompt": f"""You are a research assistant. Today is {datetime.now().strftime('%Y-%m-%d')}.
+Use tools to gather information. Structure findings with clear headings and inline citations.
+Limit to 3 search calls.""",
+    "tools": [web_search],
+}
+
+print("subagent:", research_subagent["name"])'''),
+md("""## Update your agent
+
+Your `create_deep_agent()` call from Challenge 2 is below, unchanged except for
+two new commented-out lines. **Uncomment both** — `tools=[web_search]` gives
+the agent direct web search; `subagents=[research_subagent]` gives it the
+`research-agent` to delegate to."""),
+code('''agent = create_deep_agent(
+    model=model,
+    system_prompt=f"You are a helpful research assistant. Today is {datetime.now():%Y-%m-%d}.",
+    # tools=[web_search],
+    # subagents=[research_subagent],
+    checkpointer=MemorySaver(),
+)
+agent''', tags=["instruqt-uncomment-tools-subagents"]),
+md("""### Run it
+
+A question recent enough that the model has to look it up.
+`run_name` labels this run in your traces so you and the Check can tell it
+from any other. **This is the slowest cell in the track** — a delegated run is a
+full agent run of its own. Give it a minute."""),
+code("""config = {
+    "configurable": {"thread_id": str(uuid7())},
+    "run_name": "custom-tools-and-subagents",
+}
+run_id = uuid7()
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Lightly research the latest news on AI agents this week"}]
+}, config={**config, "run_id": run_id})
+trace_link(run_id)
+
+def truncate(text, limit=1000):
+    return text if len(text) <= limit else text[:limit] + "…"
+
+for m in result["messages"]:
+    m.model_copy(update={"content": truncate(m.text)}).pretty_print()"""),
+code("""# Context isolation: what the main agent's history holds after delegating.
+from collections import Counter
+
+calls = Counter(tc["name"] for m in result["messages"] for tc in getattr(m, "tool_calls", []))
+print("Tool calls in the main agent's history:", dict(calls))
+
+reports = [m for m in result["messages"] if m.type == "tool" and m.name == "task"]
+if not reports:
+    print("No task() call this run: the agent searched directly instead of delegating.")
+for m in reports:
+    print(f"\\nresearch-agent returned {len(m.text):,} characters. Its own searches stayed in its context:\\n")
+    print(truncate(m.text, 400))"""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms the `custom-tools-and-subagents` run is in your
+traces."""),
+])
+write("04_backends_and_memory.ipynb", [
+md("""# Challenge 4 — Backends & Memory 🦜
+
+Give your agent memory that survives across threads — a different kind of
+persistence than the virtual filesystem you've used so far. **One cell is
+blank and yours to write.**"""),
+code("""import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from utils.models import model
+from utils.parallel_search import resilient_parallel_search
+from deepagents import create_deep_agent
+
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+from langsmith import uuid7
+from lab_trace import trace_link
+from IPython.display import Image, display
+from datetime import datetime
+
+# Start each run with a clean long-term memory store.
+for f in Path("/root/workshop/instruqt").glob("deep_agents_memory.db*"):
+    f.unlink()
+
+@tool(parse_docstring=True)
+def web_search(query: str) -> str:
+    \"\"\"Search the web for information on a given query.
+
+    Args:
+        query: Search query to execute.
+    \"\"\"
+    return resilient_parallel_search(query, max_retries=2)
+
+research_subagent = {
+    "name": "research-agent",
+    "description": "Delegate research tasks. Give one topic at a time.",
+    "system_prompt": f"You are a research assistant. Today is {datetime.now().strftime('%Y-%m-%d')}.\\n"
+                      "Use tools to gather information. Structure findings with clear headings and inline citations.\\n"
+                      "Limit to 3 search calls.",
+    "tools": [web_search],
+}
+
+print("Ready")"""),
+md("""## 1.4 Backends & Memory
+
+By default, files live in ephemeral state (`StateBackend`). Use
+`CompositeBackend` to route paths — e.g. `/memories/` to persistent
+`StoreBackend` while everything else stays ephemeral.
+
+`StoreBackend` is a database-backed store meant to persist memory across
+threads. Here we back it with a local SQLite file, but the LangGraph `Store`
+can be backed by the database of your choice (Postgres, etc.).
+
+`StoreBackend` scopes what it reads and writes by `namespace` — a required
+argument, and your lever for isolation: per user, per assistant, or shared
+across everyone as here."""),
+code('''import sqlite3
+from deepagents.backends import StateBackend, StoreBackend, CompositeBackend
+from langgraph.store.sqlite import SqliteStore
+
+MEMORY_DB = "/root/workshop/instruqt/deep_agents_memory.db"
+
+def open_memory_store(path=MEMORY_DB):
+    """Open (or create) a persistent SQLite-backed long-term memory store."""
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    store = SqliteStore(conn)
+    store.setup()  # creates tables IF NOT EXISTS -> safe whether or not the DB exists
+    return store
+
+store = open_memory_store()
+
+# Pass a CompositeBackend *instance* (not a factory)
+backend = CompositeBackend(
+    default=StateBackend(),                                  # ephemeral scratch space
+    routes={
+        "/memories/": StoreBackend(                          # persists across threads (SQLite on disk)
+            store=store,
+            namespace=lambda rt: ("memories", "shared"),
+        ),
+    },
+)
+
+print("backend and store ready")'''),
+md("""## Update your agent
+
+Your `create_deep_agent()` call from Challenge 3 is below, with two new
+commented-out lines.
+
+> **Uncomment both** — `backend=backend,` and `store=store,` wire in the
+> memory you just built. **Then replace the `system_prompt` value** with the
+> one below, so the agent knows to actually use `/memories/`:
+>
+> ```python
+> system_prompt=(
+>     "You are a helpful assistant. Save important facts to /memories/ for future reference. "
+>     "ALWAYS check /memories files before answering any questions to ensure you don't miss relevant information."
+> ),
+> ```"""),
+code('''agent = create_deep_agent(
+    model=model,
+    tools=[web_search],
+    system_prompt="You are a helpful research assistant.",  # <- replace with the prompt from the instructions above
+    subagents=[research_subagent],
+    # backend=backend,
+    # store=store,
+    checkpointer=MemorySaver(),
+)
+agent''', tags=["instruqt-fill-backend-memory"]),
+md("""### Thread 1: save a memory
+
+`run_name` labels this run in your traces so you and the Check can tell it
+from the next one."""),
+code("""config1 = {
+    "configurable": {"thread_id": str(uuid7())},
+    "run_name": "backends-and-memory-thread-1",
+}
+run_id = uuid7()
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Remember that my favorite programming language is Python. Save this to /memories/preferences.md"}]
+}, config={**config1, "run_id": run_id})
+trace_link(run_id)
+print("Thread 1:", result["messages"][-1].text)"""),
+md("""### Thread 2: a different thread, but memory persists
+
+Same agent, brand new `thread_id` — no shared state except what `/memories/`
+gives it through `StoreBackend`."""),
+code("""config2 = {
+    "configurable": {"thread_id": str(uuid7())},
+    "run_name": "backends-and-memory-thread-2",
+}
+run_id = uuid7()
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "What's my favorite programming language? Check /memories/"}]
+}, config={**config2, "run_id": run_id})
+trace_link(run_id)
+print("Thread 2:", result["messages"][-1].text)"""),
+md("""---
+## Next: Check
+
+Click **Check**. It reads the SQLite file and confirms the saved fact is in
+the store."""),
+])
+
+write("05_middleware_and_hitl.ipynb", [
+md("""# Challenge 5 — Middleware & HITL 🦜
+
+Add rules and auditing to every call without changing agent code, then pause
+for human approval before a tool runs. **One cell is blank and yours to
+write.**"""),
+code("""import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from datetime import datetime
+
+from utils.models import model
+from utils.parallel_search import resilient_parallel_search
+from deepagents import create_deep_agent
+from deepagents.backends import StateBackend, StoreBackend, CompositeBackend
+
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.sqlite import SqliteStore
+from langgraph.types import Command
+from langsmith import uuid7
+from lab_trace import trace_link
+from IPython.display import Image, display
+import sqlite3
+
+# Start each run with a clean long-term memory store.
+for f in Path("/root/workshop/instruqt").glob("deep_agents_memory.db*"):
+    f.unlink()
+
+@tool(parse_docstring=True)
+def web_search(query: str) -> str:
+    \"\"\"Search the web for information on a given query.
+
+    Args:
+        query: Search query to execute.
+    \"\"\"
+    return resilient_parallel_search(query, max_retries=2)
+
+research_subagent = {
+    "name": "research-agent",
+    "description": "Delegate research tasks. Give one topic at a time.",
+    "system_prompt": f"You are a research assistant. Today is {datetime.now().strftime('%Y-%m-%d')}.\\n"
+                      "Use tools to gather information. Structure findings with clear headings and inline citations.\\n"
+                      "Limit to 3 search calls.",
+    "tools": [web_search],
+}
+
+MEMORY_DB = "/root/workshop/instruqt/deep_agents_memory.db"
+
+def open_memory_store(path=MEMORY_DB):
+    \"\"\"Open (or create) a persistent SQLite-backed long-term memory store.\"\"\"
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    store = SqliteStore(conn)
+    store.setup()
+    return store
+
+store = open_memory_store()
+backend = CompositeBackend(
+    default=StateBackend(),
+    routes={
+        "/memories/": StoreBackend(
+            store=store,
+            namespace=lambda rt: ("memories", "shared"),
+        ),
+    },
+)
+
+print("Ready")"""),
+md("""## 1.5 Middleware: Pluggable Behavior
+
+Middleware hooks into `wrap_model_call` (every LLM call) and `wrap_tool_call`
+(every tool call). This lets you inject rules, audit, or intercept without
+changing agent code.
+
+<img src="../images/deepAgentMiddleware.png" style="width: auto; max-height: 380px; border-radius: 8px;">
+
+### Built-in context management
+
+Three strategies the deep-agent middleware uses to keep within the model's
+context window:
+
+<img src="../images/Offloading Inputs LangChain.png" style="width: auto; max-height: 240px; border-radius: 8px;">
+
+**Offload Large Inputs** — file write/edit tool calls leave the full content
+in conversation history. At ~85% context capacity, deep agents truncate
+older tool calls and replace them with a file-pointer reference.
+
+<img src="../images/Offloading Results LangChain.png" style="width: auto; max-height: 240px; border-radius: 8px;">
+
+**Offload Large Results** — tool results over ~20k tokens are written to the
+backend and swapped with a path + 10-line preview. The agent can re-read or
+grep the full content as needed.
+
+<img src="../images/LangChain Summarization.png" style="width: auto; max-height: 240px; border-radius: 8px;">
+
+**Conversation Summarization** — when there's nothing left to offload and
+context hits ~85% of `max_input_tokens`, history is summarized. Full messages
+move to `/conversation_history/`; a structured summary replaces them in
+working memory."""),
+code('''from langchain.agents.middleware import wrap_model_call, wrap_tool_call
+from langchain_core.messages import SystemMessage
+
+audit_log = []
+
+@wrap_model_call
+def compliance_rules(request, handler):
+    """Inject compliance rules into every LLM call."""
+    rules = """## Compliance Rules
+- Never include SSNs, credit card numbers, or account passwords in responses
+- Always cite sources when presenting research findings
+- Flag any request involving non-public financial information"""
+    existing = request.system_message
+    blocks = list(existing.content_blocks) if existing else []
+    blocks.append({"type": "text", "text": f"\\n\\n{rules}"})
+    return handler(request.override(system_message=SystemMessage(content_blocks=blocks)))
+
+@wrap_tool_call
+def audit_trail(request, handler):
+    """Create an audit log entry for every tool call."""
+    entry = {"tool": request.tool_call["name"], "timestamp": datetime.now().isoformat()}
+    result = handler(request)
+    entry["status"] = "success"
+    audit_log.append(entry)
+    return result
+
+print("middleware defined: compliance_rules, audit_trail")'''),
+md("""## 1.6 HITL: Tool-Level Approval
+
+Deep Agents supports `interrupt_on` — pause execution when specific tools are
+called. The human can approve, edit, or reject.
+
+<img src="../images/deepAgentHITL.png" style="width: auto; max-height: 380px; border-radius: 8px;">"""),
+md("""## Update your agent
+
+Your `create_deep_agent()` call from Challenge 4 is below, with two new
+commented-out blocks.
+
+> **Uncomment both** — `middleware=[compliance_rules, audit_trail],` wires in
+> the rules and auditing you just defined; `interrupt_on={...}` pauses
+> execution before `write_file` or `edit_file` runs, so a human approves
+> first."""),
+code('''agent = create_deep_agent(
+    model=model,
+    tools=[web_search],
+    system_prompt=(
+        "You are a helpful assistant. Save important facts to /memories/ for future reference. "
+        "ALWAYS check /memories files before answering any questions to ensure you don't miss relevant information."
+    ),
+    subagents=[research_subagent],
+    backend=backend,
+    store=store,
+    # middleware=[compliance_rules, audit_trail],
+    # interrupt_on={
+    #     "write_file": True,
+    #     "edit_file": True,
+    # },
+    checkpointer=MemorySaver(),
+)
+agent''', tags=["instruqt-uncomment-middleware-hitl"]),
+md("""### Run it
+
+Ask for a file to be written. With `interrupt_on` active, the agent pauses
+right before `write_file` runs instead of running it."""),
+code("""config = {
+    "configurable": {"thread_id": str(uuid7())},
+    "run_name": "middleware-and-hitl",
+}
+run_id = uuid7()
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Write a file called /test.md with 'Hello World'"}]
+}, config={**config, "run_id": run_id})
+trace_link(run_id)
+
+if result.get("__interrupt__"):
+    interrupt_info = result["__interrupt__"][0].value
+    for action in interrupt_info["action_requests"]:
+        print(f"Paused — tool: {action['name']}, args: {action['args']}")
+    print("\\nWaiting for approval...")"""),
+md("""### Approve and continue
+
+Resuming with an `approve` decision per paused action lets the tool call
+proceed — and `audit_trail` logs it, same as any other tool call."""),
+code("""if result.get("__interrupt__"):
+    pending = result["__interrupt__"][0].value["action_requests"]
+    run_id = uuid7()
+    result = agent.invoke(
+        Command(resume={"decisions": [{"type": "approve"} for _ in pending]}),
+        config={**config, "run_id": run_id},
+    )
+    trace_link(run_id)
+    print("Approved!")
+    print("Agent reply:", result["messages"][-1].text)
+
+print(f"\\n--- Audit Log ({len(audit_log)} entries) ---")
+for entry in audit_log:
+    print(f"  {entry['timestamp']}  {entry['tool']}  {entry['status']}")"""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms in your traces that `write_file` to `/test.md` ran
+after your approval, and that the compliance rules reached the model."""),
+])
+
+write("06_agents_and_skills.ipynb", [
+md("""# Challenge 6 — Agents & Skills 🦜
+
+Replace a hardcoded system prompt with an editable identity file, and load a
+skill on demand. **One cell is blank and yours to write.**"""),
+code("""import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from datetime import datetime
+
+from utils.models import model
+from utils.parallel_search import resilient_parallel_search
+from deepagents import create_deep_agent
+from deepagents.backends import StateBackend, StoreBackend, CompositeBackend
+from deepagents.backends.utils import create_file_data
+
+from langchain.agents.middleware import wrap_model_call, wrap_tool_call
+from langchain_core.messages import SystemMessage
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.sqlite import SqliteStore
+from langgraph.types import Command
+from langsmith import uuid7
+from lab_trace import trace_link
+from IPython.display import Image, display
+import sqlite3
+
+# Start each run with a clean long-term memory store.
+for f in Path("/root/workshop/instruqt").glob("deep_agents_memory.db*"):
+    f.unlink()
+
+@tool(parse_docstring=True)
+def web_search(query: str) -> str:
+    \"\"\"Search the web for information on a given query.
+
+    Args:
+        query: Search query to execute.
+    \"\"\"
+    return resilient_parallel_search(query, max_retries=2)
+
+research_subagent = {
+    "name": "research-agent",
+    "description": "Delegate research tasks. Give one topic at a time.",
+    "system_prompt": f"You are a research assistant. Today is {datetime.now().strftime('%Y-%m-%d')}.\\n"
+                      "Use tools to gather information. Structure findings with clear headings and inline citations.\\n"
+                      "Limit to 3 search calls.",
+    "tools": [web_search],
+}
+
+MEMORY_DB = "/root/workshop/instruqt/deep_agents_memory.db"
+
+def open_memory_store(path=MEMORY_DB):
+    \"\"\"Open (or create) a persistent SQLite-backed long-term memory store.\"\"\"
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    store = SqliteStore(conn)
+    store.setup()
+    return store
+
+store = open_memory_store()
+backend = CompositeBackend(
+    default=StateBackend(),
+    routes={
+        "/memories/": StoreBackend(
+            store=store,
+            namespace=lambda rt: ("memories", "shared"),
+        ),
+    },
+)
+
+audit_log = []
+
+@wrap_model_call
+def compliance_rules(request, handler):
+    \"\"\"Inject compliance rules into every LLM call.\"\"\"
+    rules = "## Compliance Rules\\n" \\
+            "- Never include SSNs, credit card numbers, or account passwords in responses\\n" \\
+            "- Always cite sources when presenting research findings\\n" \\
+            "- Flag any request involving non-public financial information"
+    existing = request.system_message
+    blocks = list(existing.content_blocks) if existing else []
+    blocks.append({"type": "text", "text": f"\\n\\n{rules}"})
+    return handler(request.override(system_message=SystemMessage(content_blocks=blocks)))
+
+@wrap_tool_call
+def audit_trail(request, handler):
+    \"\"\"Create an audit log entry for every tool call.\"\"\"
+    entry = {"tool": request.tool_call["name"], "timestamp": datetime.now().isoformat()}
+    result = handler(request)
+    entry["status"] = "success"
+    audit_log.append(entry)
+    return result
+
+print("Ready")"""),
+md("""## 1.7 AGENTS.md & Skills
+
+`AGENTS.md` replaces hardcoded system prompts with an editable identity file.
+Skills are loaded on demand — the agent reads them only when the task
+matches."""),
+code('''agents_md = \"\"\"# Research Assistant
+
+You are an expert research assistant.
+
+## Workflow
+1. Plan with write_todos
+2. Delegate research to research-agent via task()
+3. Synthesize findings into a report
+4. Save to /final_report.md
+
+## Rules
+- Delegate research, don't search directly
+- Consolidate citations [1], [2], [3]
+- Check /skills/ for content format instructions
+\"\"\"
+
+linkedin_skill = \"\"\"---
+name: linkedin-post
+description: Write a LinkedIn post. Use when asked for LinkedIn content or thought leadership.
+---
+
+# LinkedIn Post Skill
+
+- Bold hook as first line (before the "see more" cut)
+- 3-5 short paragraphs with 1-2 emojis each
+- End with a CTA or question
+- 3-5 hashtags at the bottom
+- 150-300 words
+\"\"\"
+
+print("AGENTS.md and skill content ready")'''),
+md("""## Update your agent
+
+Your `create_deep_agent()` call from Challenge 5 is below, with one line
+commented out and two new ones.
+
+> **Comment out `system_prompt=(...)`** — `AGENTS.md` replaces it, so keeping
+> both is redundant. **Uncomment `memory=["/AGENTS.md"]` and
+> `skills=["/skills/"]`** — the agent's identity now lives in an editable
+> file instead of a hardcoded string."""),
+code('''agent = create_deep_agent(
+    model=model,
+    tools=[web_search],
+    # system_prompt=(
+    #     "You are a helpful assistant. Save important facts to /memories/ for future reference. "
+    #     "ALWAYS check /memories files before answering any questions to ensure you don't miss relevant information."
+    # ),
+    subagents=[research_subagent],
+    backend=backend,
+    store=store,
+    middleware=[compliance_rules, audit_trail],
+    interrupt_on={
+        "write_file": True,
+        "edit_file": True,
+    },
+    checkpointer=MemorySaver(),
+    # memory=["/AGENTS.md"],
+    # skills=["/skills/"],
+)
+agent''', tags=["instruqt-uncomment-agents-skills"]),
+md("""### Run it
+
+`AGENTS.md` tells the agent to save its report and check `/skills/` for
+format rules. `interrupt_on` is still active from Challenge 5, so this cell
+approves automatically if a write gets paused."""),
+code("""config = {
+    "configurable": {"thread_id": str(uuid7())},
+    "run_name": "agents-and-skills",
+}
+run_id = uuid7()
+result = agent.invoke({
+    "messages": [{"role": "user", "content": "Research AI agents briefly, then write a LinkedIn post about it and save it to /final_report.md. Do not call write_todos, just do it."}],
+    "files": {
+        "/AGENTS.md": create_file_data(agents_md),
+        "/skills/linkedin-post/SKILL.md": create_file_data(linkedin_skill),
+    },
+}, config={**config, "run_id": run_id})
+trace_link(run_id)
+
+if result.get("__interrupt__"):
+    pending = result["__interrupt__"][0].value["action_requests"]
+    run_id = uuid7()
+    result = agent.invoke(
+        Command(resume={"decisions": [{"type": "approve"} for _ in pending]}),
+        config={**config, "run_id": run_id},
+    )
+    trace_link(run_id)
+
+def truncate(text, limit=1000):
+    return text if len(text) <= limit else text[:limit] + "…"
+
+for m in result["messages"]:
+    m.model_copy(update={"content": truncate(m.text)}).pretty_print()"""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms in your traces that the agent wrote
+`/final_report.md`, and that your `AGENTS.md` and the skill list reached the
+model."""),
+])
+
+write("07_the_complete_agent.ipynb", [
+md("""# Challenge 7 — The Complete Agent 🦜
+
+All pieces together: tools, subagents, memory, middleware, HITL, AGENTS.md,
+and skills. **One cell is blank and yours to write.**"""),
+code("""import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from datetime import datetime
+
+from utils.models import model
+from utils.parallel_search import resilient_parallel_search
+from deepagents import create_deep_agent
+from deepagents.backends import StateBackend, StoreBackend, CompositeBackend
+from deepagents.backends.utils import create_file_data
+
+from langchain.agents.middleware import wrap_model_call, wrap_tool_call
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.sqlite import SqliteStore
+from langgraph.types import Command
+from langsmith import uuid7
+from lab_trace import trace_link
+from IPython.display import Image, display
+import sqlite3
+
+# Start each run with a clean long-term memory store.
+for f in Path("/root/workshop/instruqt").glob("deep_agents_memory.db*"):
+    f.unlink()
+
+@tool(parse_docstring=True)
+def web_search(query: str) -> str:
+    \"\"\"Search the web for information on a given query.
+
+    Args:
+        query: Search query to execute.
+    \"\"\"
+    return resilient_parallel_search(query, max_retries=2)
+
+research_subagent = {
+    "name": "research-agent",
+    "description": "Delegate research tasks. Give one topic at a time.",
+    "system_prompt": f"You are a research assistant. Today is {datetime.now().strftime('%Y-%m-%d')}.\\n"
+                      "Use tools to gather information. Structure findings with clear headings and inline citations.\\n"
+                      "Limit to 3 search calls.",
+    "tools": [web_search],
+}
+
+audit_log = []
+
+@wrap_model_call
+def compliance_rules(request, handler):
+    \"\"\"Inject compliance rules into every LLM call.\"\"\"
+    rules = "## Compliance Rules\\n" \\
+            "- Never include SSNs, credit card numbers, or account passwords in responses\\n" \\
+            "- Always cite sources when presenting research findings\\n" \\
+            "- Flag any request involving non-public financial information"
+    existing = request.system_message
+    blocks = list(existing.content_blocks) if existing else []
+    blocks.append({"type": "text", "text": f"\\n\\n{rules}"})
+    return handler(request.override(system_message=SystemMessage(content_blocks=blocks)))
+
+@wrap_tool_call
+def audit_trail(request, handler):
+    \"\"\"Create an audit log entry for every tool call.\"\"\"
+    entry = {"tool": request.tool_call["name"], "timestamp": datetime.now().isoformat()}
+    result = handler(request)
+    entry["status"] = "success"
+    audit_log.append(entry)
+    return result
+
+agents_md = \"\"\"# Research Assistant
+
+You are an expert research assistant.
+
+## Workflow
+1. Plan with write_todos
+2. Delegate research to research-agent via task()
+3. Synthesize findings into a report
+4. Save to /final_report.md
+
+## Rules
+- Delegate research, don't search directly
+- Consolidate citations [1], [2], [3]
+- Check /skills/ for content format instructions
+\"\"\"
+
+linkedin_skill = \"\"\"---
+name: linkedin-post
+description: Write a LinkedIn post. Use when asked for LinkedIn content or thought leadership.
+---
+
+# LinkedIn Post Skill
+
+- Bold hook as first line (before the "see more" cut)
+- 3-5 short paragraphs with 1-2 emojis each
+- End with a CTA or question
+- 3-5 hashtags at the bottom
+- 150-300 words
+\"\"\"
+
+print("Ready")"""),
+md("""## Build the backend and store
+
+Same SQLite-backed long-term memory as Challenge 4, freshly opened for this
+run."""),
+code("""MEMORY_DB = "/root/workshop/instruqt/deep_agents_memory.db"
+
+def open_memory_store(path=MEMORY_DB):
+    \"\"\"Open (or create) a persistent SQLite-backed long-term memory store.\"\"\"
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+    store = SqliteStore(conn)
+    store.setup()
+    return store
+
+store = open_memory_store()
+complete_backend = CompositeBackend(
+    default=StateBackend(),
+    routes={
+        "/memories/": StoreBackend(
+            store=store,
+            namespace=lambda rt: ("memories", "shared"),
+        ),
+    },
+)
+
+print("backend and store ready")"""),
+md("""## Build the complete agent
+
+Every kwarg from Challenges 2 through 6, together, nothing commented out —
+this is the accumulation all of them were building toward."""),
+code("""complete_agent = create_deep_agent(
+    model=model,
+    tools=[web_search],
+    subagents=[research_subagent],
+    backend=complete_backend,
+    store=store,
+    middleware=[compliance_rules, audit_trail],
+    checkpointer=MemorySaver(),
+    interrupt_on={"write_file": True, "edit_file": True},
+    memory=["/AGENTS.md"],
+    skills=["/skills/"],
+)
+
+print("Complete agent created with:")
+print("  - Custom tools (web_search)")
+print("  - Subagents (research-agent)")
+print("  - Memory (/memories/ -> StoreBackend on SQLite)")
+print("  - Middleware (compliance rules + audit trail)")
+print("  - HITL (interrupt on file writes)")
+print("  - AGENTS.md + Skills")"""),
+md("""## Run it
+
+One task that exercises everything: subagent delegation, a file write
+(HITL-gated), `/memories/` persistence, and middleware."""),
+code("""config = {
+    "configurable": {"thread_id": str(uuid7())},
+    "run_name": "the-complete-agent",
+}
+
+# Seed AGENTS.md + the LinkedIn skill (same content as Challenge 6) so the
+# agent has its identity and capabilities loaded.
+seed_files = {
+    "/AGENTS.md": create_file_data(agents_md),
+    "/skills/linkedin-post/SKILL.md": create_file_data(linkedin_skill),
+}
+
+run_id = uuid7()
+result = complete_agent.invoke({
+    "messages": [HumanMessage(content=(
+        "Research the LangChain v1 release briefly. "
+        "Follow your AGENTS.md workflow: delegate research, write the final report to /final_report.md, "
+        "and save key takeaways to /memories/research_notes.md. "
+        "Search at most once."
+    ))],
+    "files": seed_files,
+}, config={**config, "run_id": run_id})
+trace_link(run_id)"""),
+md("""## Write the approval loop yourself
+
+The HITL middleware pauses on every `write_file` / `edit_file` call — and
+this task makes two of them. **The next cell is blank.**
+
+> **Uncomment-and-write:** loop `while result.get("__interrupt__")`. Each
+> time, read `result["__interrupt__"][0].value["action_requests"]`, then
+> resume with
+> `Command(resume={"decisions": [{"type": "approve"} for _ in actions]})`.
+> A single `if` (like Challenge 5's) only handles one pause — this task
+> needs a loop."""),
+code('''# ---------------------------------------------------------- YOUR TURN
+# The HITL middleware pauses on every write_file / edit_file call. Approve
+# every pause in a loop until there are none left:
+# while result.get("__interrupt__"):
+#     payload = result["__interrupt__"][0].value
+#     actions = payload.get("action_requests", [])
+#     for action in actions:
+#         print(f"  HITL pause -> approving {action['name']}: {action['args'].get('file_path','?')}")
+#     result = complete_agent.invoke(
+#         Command(resume={"decisions": [{"type": "approve"} for _ in actions]}),
+#         config=config,
+#     )''',
+     tags=["instruqt-blank-approval-loop"]),
+md("""## See everything together
+
+Only files the agent wrote itself (the two seed files are filtered out), and
+every tool call the audit middleware recorded."""),
+code('''print("\\nFinal reply:\\n", result["messages"][-1].text[:600])
+print()
+
+seed_paths = set(seed_files.keys())
+agent_files = {k: v for k, v in (result.get("files") or {}).items() if k not in seed_paths}
+
+def print_files(result, header="VIRTUAL FILESYSTEM (in-memory, not on disk!)"):
+    files = result.get("files") or {}
+    if not files:
+        print("(no files in state)")
+        return
+    print("=" * 50)
+    print(header)
+    print("=" * 50)
+    for path, file_data in files.items():
+        print(f"\\n  Path: {path!r}")
+        print("  " + "-" * 38)
+        content = file_data
+        if isinstance(file_data, dict) and "content" in file_data:
+            content = file_data["content"]
+        if isinstance(content, list):
+            content = "\\n".join(content)
+        for line in str(content).split("\\n"):
+            print(f"  | {line}")
+
+print_files({"files": agent_files}, header="FILES THE AGENT WROTE")
+
+print(f"\\nAudit log: {len(audit_log)} tool call(s) recorded by the audit middleware")
+for entry in audit_log:
+    print(f"  {entry['timestamp']}  {entry['tool']:20s} {entry['status']}")'''),
+md("""### Deep Agents Recap
+
+| Feature | How | Built-in? |
+|---------|-----|----------|
+| **Harness** | `create_deep_agent()` | Filesystem, Planning, Summarization |
+| **Custom tools** | `tools=[your_tool]` | Added to built-in tools |
+| **Subagents** | `subagents=[{name, description, ...}]` | `task()` tool |
+| **Memory** | `CompositeBackend` routing to `StoreBackend` | Path-based routing |
+| **Middleware** | `middleware=[wrap_model_call, wrap_tool_call]` | Appended to built-in stack |
+| **HITL** | `interrupt_on={"write_file": True}` | Configurable per tool |
+| **AGENTS.md** | `memory=["/AGENTS.md"]` or `files={}` | Editable identity |
+| **Skills** | `skills=["./skills/"]` or `files={}` | On-demand capabilities |"""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms in your traces that the approved `write_file` to
+`/final_report.md` ran, and reads `/memories/research_notes.md` from the
+store."""),
+])
+
+# ---- challenges 8-9: upstream modules/03_deploy_and_govern.ipynb, split ----
+# ---- challenges 10-14: upstream modules/04_langsmith.ipynb, split ----
+# One upstream part per challenge, the way challenges 2-7 split
+# 01_deep_agents.ipynb. Each notebook stands alone (own Setup cell), because
+# skipping is enabled and a kernel never carries state between challenges.
+#
+# Adapted from upstream in these places:
+#   - absolute Setup paths, same as every notebook above
+#   - Gateway (8) is optional and ungraded: it needs the Gateway enabled for
+#     the learner's org, admin rights and an upstream provider, so each cell
+#     reports a missing prerequisite and carries on instead of raising
+#   - §1.4 is read-only: switching utils/models.py to the Gateway would break
+#     challenges 10-14 for anyone without Gateway access
+#   - every workspace-global name carries WORKSHOP_SFX, because a room often
+#     shares one LangSmith workspace (upstream's dataset cell DELETES an existing
+#     dataset of the same name)
+#   - `langgraph validate` only schema-checks langgraph.json, so challenge 9
+#     also builds the graph (see check_deploy.py)
+#   - the Harbor job (13) runs only with RUN_HARBOR = True: it needs LangSmith
+#     Sandboxes, and passes the sandbox's AWS credentials into the trial
+#     container for Bedrock
+#   - UI links follow the learner's region instead of assuming smith.langchain.com
+#   - one blanked cell per graded challenge, tagged, filled by fill_blank.py
+
+# Setup shared by the LangSmith challenges (10, 11, 12, 14), which all need the
+# learner's key.
+LS_SETUP = """import os
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from dotenv import load_dotenv
+
+load_dotenv("/root/workshop/.env", override=True)
+
+if not os.environ.get("LANGSMITH_API_KEY"):
+    raise SystemExit(
+        "This challenge needs a LangSmith key. Open 01_setup.ipynb, re-run its "
+        "first cell and enter one, then re-run this cell."
+    )
+
+from langsmith import Client, uuid7
+from lab_state import mark_done
+from lab_trace import trace_link
+
+SFX = os.environ["WORKSHOP_SFX"]
+PROJECT = os.environ["LANGSMITH_PROJECT"]
+UI = (os.environ.get("LANGSMITH_ENDPOINT") or "https://api.smith.langchain.com").replace("api.smith", "smith")
+client = Client()
+"""
+
+# ---- challenge 8: Gateway Policies (upstream module 3, Part 1) ----
+write("08_gateway_policies.ipynb", [
+md("""# Challenge 8 — Gateway Policies 🦜
+
+Put a workspace policy in front of every model call with the LangSmith LLM
+Gateway.
+
+> **Optional, not graded.** Needs the LangSmith key from Challenge 1, the LLM
+> Gateway enabled for your organization, workspace-admin rights, and an
+> upstream provider for the gateway to call (an OpenAI key in workspace
+> Provider Secrets, or Gateway Credits). If any is missing, each cell prints
+> why. Continue to Challenge 9."""),
+code("""import os
+import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from dotenv import load_dotenv
+
+load_dotenv("/root/workshop/.env", override=True)
+
+import requests
+from langsmith import Client, uuid7
+from lab_trace import trace_link
+
+if not os.environ.get("LANGSMITH_API_KEY"):
+    raise SystemExit(
+        "This challenge needs a LangSmith key. Open 01_setup.ipynb, re-run its "
+        "first cell and enter one, then re-run this cell."
+    )
+
+SFX = os.environ["WORKSHOP_SFX"]
+LS_API = os.environ.get("LANGSMITH_ENDPOINT") or "https://api.smith.langchain.com"
+HEADERS = {"X-Api-Key": os.environ["LANGSMITH_API_KEY"], "Content-Type": "application/json"}
+
+client = Client()
+try:
+    workspace_id = str(client.read_project(project_name=os.environ["LANGSMITH_PROJECT"]).tenant_id)
+except Exception:
+    workspace_id = str(next(iter(client.list_projects(limit=1))).tenant_id)
+
+print("langsmith api :", LS_API.replace("https://", ""))
+print("workspace id  :", workspace_id)"""),
+md("""## The LLM Gateway
+
+The **LangSmith LLM Gateway** is a managed proxy between a model client and
+the model provider. Point a client's `base_url` at the gateway and every
+request goes through it. No SDK changes.
+
+**Gateway policies** are rules the gateway applies to that traffic. A policy
+is declared once per workspace and applies to every gateway-routed call, from
+any agent or notebook.
+
+> The policy below applies to **everyone in your workspace** who routes
+> traffic through the gateway. Run the delete cell at the end."""),
+md("""## 1. Create a PII / secrets policy
+
+One POST to `/v1/platform/gateway-policies` creates the policy:
+
+- `action="block"`: intercept matched content before it goes upstream
+- `subject_matchers`: apply to this workspace's traffic
+- `config.detect.pii` / `.secrets`: what to detect
+
+The name ends in your sandbox suffix so it can't collide with another
+attendee's."""),
+code("""policy = {
+    "name": f"redact-pii-secrets-{SFX}",
+    "description": "Workspace-level PII and secrets redaction",
+    "policy_type": "guard",
+    "action": "block",
+    "subject_matchers": [{"key": "workspace_id", "value": workspace_id}],
+    "config": {"version": 1, "detect": {"pii": True, "secrets": True}},
+    "enabled": True,
+}
+
+resp = requests.post(
+    f"{LS_API}/v1/platform/gateway-policies",
+    headers=HEADERS,
+    json=policy,
+    timeout=30,
+)
+
+policy_id = None
+if resp.ok:
+    created = resp.json()
+    policy_id = created.get("id")
+    print("Policy created.")
+    print("  id:     ", policy_id)
+    print("  name:   ", created.get("name"))
+    print("  action: ", created.get("action"))
+    print("  enabled:", created.get("enabled"))
+else:
+    print(f"Policy not created (HTTP {resp.status_code}).")
+    print("Usually the Gateway isn't enabled for your org, or your key lacks admin rights.")
+    print("This challenge is optional: continue to Challenge 9.")"""),
+md("""## 2. Route an agent through the gateway
+
+The policy only covers traffic that goes through the gateway. To opt a client
+in, set its `base_url` to `https://gateway.smith.langchain.com/<provider>` and
+authenticate with your LangSmith key.
+
+The cell builds a `create_deep_agent` on a gateway-routed OpenAI model and
+sends a clean prompt, to confirm normal traffic still passes. Set
+`GATEWAY_MODEL` to a model your workspace's provider credentials can reach."""),
+code("""from deepagents import create_deep_agent
+from langchain.chat_models import init_chat_model
+
+GATEWAY_MODEL = "gpt-5.6-terra"
+
+gateway_model = init_chat_model(
+    model=GATEWAY_MODEL,
+    model_provider="openai",
+    base_url="https://gateway.smith.langchain.com/openai",
+    use_responses_api=True,
+    api_key=os.environ["LANGSMITH_API_KEY"],
+)
+
+demo_agent = create_deep_agent(
+    model=gateway_model,
+    system_prompt=(
+        "You are a helpful assistant behind the LangSmith Gateway, which redacts "
+        "sensitive data before you see it, replacing each value with a token like "
+        "[SAFE_TO_USE:EMAIL_ADDRESS_a1b2c3]. Treat each token as the real value, "
+        "answer normally, and repeat tokens verbatim — the Gateway restores the real "
+        "value in your reply. When a reply involves redacted data, start with one line: "
+        "🔒 Gateway redacted N sensitive value(s) before I saw them."
+    ),
+)
+
+gateway_ok = False
+try:
+    ok = demo_agent.invoke({
+        "messages": [{"role": "user", "content": "In one sentence, what does LangSmith do?"}]
+    })
+    print(ok["messages"][-1].text)
+    gateway_ok = True
+except Exception as exc:
+    print(f"Gateway call failed ({type(exc).__name__}).")
+    print("Check the Gateway is enabled and can reach GATEWAY_MODEL, or continue to Challenge 9.")"""),
+md("""## 3. Watch the policy act
+
+Same agent and gateway, but this prompt contains a (fake) email address. The
+gateway matches it against the policy and intercepts the PII before the request
+goes upstream.
+
+The reply alone doesn't show whether the policy fired. Open the trace and
+compare the request the gateway sent upstream with the prompt below."""),
+code("""if not gateway_ok:
+    print("Skipped: the gateway call in step 2 didn't succeed.")
+else:
+    run_id = uuid7()
+    try:
+        result = demo_agent.invoke(
+            {"messages": [{"role": "user", "content": "Contact me at jane.doe@example.com for the quarterly report."}]},
+            config={"run_id": run_id, "run_name": "gateway-pii-demo"},
+        )
+        print(result["messages"][-1].text)
+    except Exception as exc:
+        print(f"The gateway rejected the request ({type(exc).__name__}).")
+    trace_link(run_id)"""),
+md("""## 4. Route the shared model through the gateway
+
+Every notebook and the deployable agent import `model` from
+`utils/models.py`, so changing that one file routes all of them through the
+gateway. Upstream, the change is:
+
+Before (direct):
+```python
+# utils/models.py
+MODEL_SPEC = {"model": "openai:gpt-5.6-luna", "use_responses_api": True}
+API_KEY_ENV = "OPENAI_API_KEY"
+```
+
+After (through the LangSmith Gateway):
+```python
+# utils/models.py
+MODEL_SPEC = {
+    "model": "openai:gpt-5.6-luna",
+    "base_url": "https://gateway.smith.langchain.com/openai",
+    "use_responses_api": True,
+}
+API_KEY_ENV = "LANGSMITH_API_KEY_GATEWAY"
+```
+
+**Don't make this change in this sandbox.** Here `utils/models.py` runs Claude
+on Bedrock with the sandbox's AWS credentials, and Challenges 9–14 depend on
+it.
+
+> **Why `LANGSMITH_API_KEY_GATEWAY` and not `LANGSMITH_API_KEY`?**
+> `langgraph deploy` strips the reserved `LANGSMITH_API_KEY` variable on
+> upload, because the platform manages tracing. A second variable holding the
+> same workspace key lets the deployed graph authenticate to the gateway."""),
+md("""## 5. Delete the policy
+
+Removes the policy from step 1 so it stops applying to your workspace."""),
+code("""if policy_id:
+    resp = requests.delete(
+        f"{LS_API}/v1/platform/gateway-policies/{policy_id}",
+        headers=HEADERS,
+        timeout=30,
+    )
+    if resp.ok:
+        print("Policy deleted.")
+    else:
+        print(f"Delete failed (HTTP {resp.status_code}). Remove '{policy['name']}' from the Gateway page in LangSmith.")
+else:
+    print("No policy was created, so there's nothing to delete.")"""),
+md("""---
+## Next
+
+This challenge isn't graded. Click **Check** to continue to Challenge 9."""),
+])
+
+# ---- challenge 9: Package & Deploy (upstream module 3, Part 2) ----
+# Blank: the two lines that build the graph from its factory. No LangSmith key
+# is needed for the graded part; only the optional deploy uses one.
+write("09_package_and_deploy.ipynb", [
+md("""# Challenge 9 — Package & Deploy 🦜
+
+Package the deep agent so LangSmith Deployments can serve it.
+**One cell is blank and yours to write.**"""),
+code("""import os
+import subprocess
+import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from dotenv import load_dotenv
+
+load_dotenv("/root/workshop/.env", override=True)
+
+from lab_state import mark_done
+
+project_root = Path("/root/workshop")
+agent_dir = project_root / "agents" / "deep_agent"
+VENV_BIN = Path(sys.executable).parent
+SFX = os.environ["WORKSHOP_SFX"]
+
+print("Ready")"""),
+md("""## 1. Project structure
+
+The deployable agent is in `agents/deep_agent/`. A deployable LangGraph
+project is a directory with `langgraph.json` at its root, pointing at one or
+more graphs. This one registers `deep_agent` →
+`./agents/deep_agent/agent.py:agent`. `dependencies: ["."]` installs the
+project's own `pyproject.toml` into the image.
+
+`agent.py` imports `model` from `utils.models`, so a deployment uses whatever
+that file configures. In this sandbox, that's Claude on Bedrock."""),
+code("""for root, dirs, files in os.walk(agent_dir):
+    dirs[:] = [d for d in dirs if d != "__pycache__"]
+    level = root.replace(str(agent_dir), "").count(os.sep)
+    indent = "  " * level
+    print(f"{indent}{os.path.basename(root)}/")
+    for f in files:
+        print(f"{indent}  {f}")"""),
+code("""print("langgraph.json:")
+print((project_root / "langgraph.json").read_text())
+
+print("AGENTS.md:")
+print((agent_dir / "AGENTS.md").read_text())"""),
+md("""`agent` in `agent.py` is a factory: `agent(config)` returns the compiled
+graph. The server calls it per run, so a LangSmith assistant can pin options
+in `config["configurable"]`: `search_tool`, `interrupts`, and
+`context_repo`."""),
+md("""## 2. CLI commands
+
+Run from the repo root, where `langgraph.json` lives:
+
+```bash
+langgraph validate          # check langgraph.json against the config schema
+langgraph dev --port 2024   # local server + Studio UI, hot reload
+langgraph deploy            # build and deploy to LangSmith (beta)
+```
+
+`langgraph dev` serves Studio on port 2024, which this sandbox doesn't expose
+to your browser. Run it on your own machine.
+
+**Docs:** [LangGraph CLI reference](https://docs.langchain.com/langsmith/langgraph-cli) · [Deploy on Cloud](https://docs.langchain.com/langsmith/deploy-to-cloud)"""),
+md("""## 3. Validate the config
+
+`langgraph validate` checks `langgraph.json` against the config schema. It
+doesn't import the graphs, so a wrong module path still passes."""),
+code("""validate = subprocess.run(
+    [str(VENV_BIN / "langgraph"), "validate"],
+    cwd=project_root,
+    capture_output=True,
+    text=True,
+)
+print(validate.stdout.strip() or validate.stderr.strip())"""),
+md("""## 4. Build the graph yourself
+
+At startup, the server imports each graph's module and calls the factory.
+Doing the same here catches what `validate` can't. **The next cell is blank.**
+
+> **Uncomment the three lines** to import the `agent` factory, call it, and
+> print the graph's nodes. Select them and press `Cmd+/` (`Ctrl+/` on
+> Windows)."""),
+code("""# ---------------------------------------------------------- YOUR TURN
+# from agents.deep_agent.agent import agent as make_agent
+# graph = make_agent()
+# print(f"Built {type(graph).__name__}. Nodes: {', '.join(graph.get_graph().nodes)}")""",
+     tags=["instruqt-blank-build-graph"]),
+md("""Confirm both steps passed:"""),
+code("""assert validate.returncode == 0, "langgraph validate failed: see the output of step 3"
+graph.get_graph()  # NameError here: the cell above is still commented out
+
+mark_done("/tmp/.deploy-validate-ok")
+print("langgraph.json validates and the graph builds.")"""),
+md("""## 5. Deploy to LangSmith (optional, not graded)
+
+`langgraph deploy` builds the image and creates a deployment in your LangSmith
+workspace. This sandbox has no Docker, so `--remote` builds on LangSmith's
+builder. Provisioning takes several minutes.
+
+Before you set `DEPLOY = True`:
+
+- **Key type.** Deploying needs a service key (`lsv2_sk_...`) with deployment
+  permissions. A personal token (`lsv2_pt_...`) fails.
+- **Cost.** This creates a real deployment in your workspace. Delete it with
+  the next cell when you're done.
+- **Secrets.** `langgraph.json` sets `"env": ".env"`, so the CLI uploads this
+  sandbox's `.env` values as deployment secrets. Those include the sandbox's
+  AWS credentials, which expire when the sandbox ends; after that the
+  deployment can't reach Bedrock.
+- **Build context.** Everything in the repo directory goes into the build.
+  Exclude `.env` with a `.dockerignore`. `.gitignore` doesn't exclude it.
+
+Useful flags:
+- `--name <name>`: deployment name. Re-running with the same name pushes a new revision.
+- `--deployment-type prod`: production deployment (default `dev`)
+- `--no-wait`: return without waiting for the deployment to be ready"""),
+code("""DEPLOY = False  # set to True to deploy
+
+DEPLOYMENT_NAME = f"modular-workshops-deep-agent-{SFX}"
+
+if DEPLOY:
+    !cd "{project_root}" && "{VENV_BIN}/langgraph" deploy --name {DEPLOYMENT_NAME} --remote --no-input
+else:
+    print("Skipped. Set DEPLOY = True and re-run this cell to deploy.")"""),
+md("""Delete the deployment when you're done. `deploy list` prints its ID; paste it
+into `DEPLOYMENT_ID`."""),
+code("""DEPLOYMENT_ID = ""  # from `deploy list`
+
+if DEPLOY:
+    !"{VENV_BIN}/langgraph" deploy list
+if DEPLOYMENT_ID:
+    !"{VENV_BIN}/langgraph" deploy delete {DEPLOYMENT_ID} --force"""),
+md("""## 6. What a deployment provides
+
+| Capability | What you can do |
+|---|---|
+| **REST API** | HTTP requests against `/runs`, `/threads`, `/store` |
+| **Studio UI** | Step through state, threads, and tool calls |
+| **Agent Protocol** | Stream runs and pause for human input |
+| **MCP server** | Other agents call your agent as a tool |
+| **A2A** | Agent-to-agent calls with handoffs |
+| **Persistent Store** | `/memories/` survives restarts and threads |
+| **HITL** | Interrupt and resume from any client |
+| **Cron / scheduled runs** | Trigger the agent on a schedule |
+
+## Recap: Govern + Deploy
+
+| Pillar | What | How |
+|---|---|---|
+| **Govern** | Workspace PII / secrets policy | `POST /v1/platform/gateway-policies` (`action=block`) |
+| **Govern** | Route model calls through the gateway | `base_url="https://gateway.smith.langchain.com/openai"` in `utils/models.py` |
+| **Deploy** | Deployable graph config | `langgraph.json` at the repo root |
+| **Deploy** | Agent identity + skills | `AGENTS.md`, `skills/` |
+| **Deploy** | Ship it | `langgraph deploy --name <deployment-name>` |"""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms step 4 passed, then runs `langgraph validate` and
+builds the graph itself."""),
+])
+
+# ---- challenge 10: Prompts (upstream module 4, Part 1) ----
+# Blank: the second push_prompt, which records the second commit.
+write("10_prompts.ipynb", [
+md("""# Challenge 10 — Prompts 🦜
+
+Author, version, and share prompts in LangSmith, then pull them into code.
+**One cell is blank and yours to write.**
+
+This challenge needs the LangSmith key from Challenge 1."""),
+code(LS_SETUP + """
+from utils.models import model
+
+print("Prompt names end in:", SFX)"""),
+md("""LangSmith treats prompts as **versioned artifacts**:
+
+- **Playground** (UI): compose messages, add input variables, pick a model, run.
+- **Prompt Hub** (UI): every saved prompt with its commit history and tags, plus public prompts to fork.
+- **SDK**: `push_prompt` / `pull_prompt` move prompts between code and the hub."""),
+md("""## 1. The Playground
+
+Open **Prompts** in the LangSmith sidebar and click **+ Prompt**. The left
+panel is the prompt: an ordered list of messages, each with a role:
+
+- **System**: persona and ground rules
+- **Human**: the user's turn
+- **AI**: a model turn, for few-shot examples
+- **Tool**: tool output, to test how the model reacts to it
+
+Type `{variable_name}` in any message to add an input variable, fill in
+sample values under **Inputs**, and click **Start**.
+
+- **Template format.** Variables default to f-string syntax (`{topic}`). Switch to mustache (`{{topic}}`) for loops, conditionals, or nested data (`{{user.name}}`).
+- **Model configuration.** The gear icon next to the model name sets provider, model, temperature, and max tokens. **Save As** names the configuration so the workspace can reuse it.
+- **Tools.** **+ Tool** attaches built-in or custom tools. The Playground shows each tool call's name and arguments."""),
+code("""print(f"Prompts: {UI}/prompts  (click + Prompt to open the Playground)")"""),
+md("""## 2. Prompt Hub: save, version, share
+
+**Save** in the Playground adds the prompt to the **Prompts** table. Each
+prompt's page shows its commit history and environments on the left, and the
+selected commit on the right.
+
+- **Commits**: every save is a commit. **Diff** compares a commit with the one before it.
+- **Tags**: a stable name for a commit (e.g. `prod`), so code needn't pin a hash.
+- **Environments**: **Staging** and **Production** track which commit is live. **Promote** moves a commit forward.
+- **Public hub**: search community prompts and **fork** one into your workspace."""),
+md("""## 3. Push a prompt from the SDK
+
+The name ends in your sandbox suffix so it can't collide with another
+attendee's."""),
+code("""from langchain_core.prompts import ChatPromptTemplate
+
+prompt_name = f"client-research-assistant-{SFX}"
+prompt = ChatPromptTemplate([
+    ("system",
+     "You are a client research assistant for a wealth management firm. "
+     "Look up the client, then produce a concise pre-meeting briefing: "
+     "(1) a one-line summary, (2) likely priorities and risk tolerance, "
+     "(3) three tailored talking points, and (4) two questions the advisor should ask. "
+     "Be factual and neutral; do not give specific investment advice."),
+])
+
+url = client.push_prompt(prompt_name, object=prompt)
+print("Prompt page:", url)"""),
+md("""## 4. Pull it and run it as an agent
+
+`pull_prompt` returns the prompt just pushed. It becomes the system prompt for
+`create_agent`, on the workshop's shared `model`. A mock `lookup_client` tool
+gives the agent something to call, so the trace shows the full loop:
+model → tool → model."""),
+code('''from langchain.agents import create_agent
+from langchain_core.tools import tool
+
+
+@tool
+def lookup_client(name: str) -> str:
+    """Look up a wealth-management client's profile by name."""
+    # Mock CRM lookup.
+    directory = {
+        "Rohan Mehta": (
+            "Rohan Mehta, 52, senior law-firm partner. ~$4.2M investable assets, "
+            "moderately conservative. Two kids entering college within 3 years. "
+            "Recently asked about tax-efficient withdrawals and ESG options."
+        ),
+    }
+    return directory.get(name, f"No profile found for {name!r}.")
+
+
+pulled = client.pull_prompt(prompt_name)
+system_prompt = pulled.format_messages()[0].content
+
+agent = create_agent(model=model, tools=[lookup_client], system_prompt=system_prompt)
+
+run_id = uuid7()
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Prep me for my meeting with Rohan Mehta."}]},
+    config={"run_id": run_id, "run_name": "prompt-hub-agent"},
+)
+print(result["messages"][-1].text)
+trace_link(run_id)'''),
+md("""## 5. Version it yourself
+
+Pushing again under the same name records a new commit. The earlier version
+stays in the history. **The push in the next cell is commented out.**
+
+> **Uncomment the two lines** that push `prompt_v2` and print its URL."""),
+code("""prompt_v2 = ChatPromptTemplate([
+    ("system",
+     "You are a client research assistant for a wealth management firm. "
+     "Look up the client, then produce a concise pre-meeting briefing: "
+     "(1) a one-line summary, (2) likely priorities and risk tolerance, "
+     "(3) three tailored talking points, (4) two questions the advisor should ask, "
+     "and (5) one risk or compliance flag to keep in mind. "
+     "Be factual and neutral; do not give specific investment advice."),
+])
+
+# ---------------------------------------------------------- YOUR TURN
+# url_v2 = client.push_prompt(prompt_name, object=prompt_v2)
+# print("New commit:", url_v2)""",
+     tags=["instruqt-blank-push-v2"]),
+md("""Open the prompt page and toggle **Diff** to compare the two commits. Pull a
+specific commit with `client.pull_prompt(f"{prompt_name}:<commit-hash>")`."""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms your prompt has at least two commits and that the
+latest one is `prompt_v2`."""),
+])
+
+# ---- challenge 11: Tracing (upstream module 4, warm-up + Part 2) ----
+# Blank: the filter DSL expression in the slow-runs query.
+write("11_tracing.ipynb", [
+md("""# Challenge 11 — Tracing 🦜
+
+Generate traces with the research agent, then query them with
+`client.list_runs`. **One cell is blank and yours to write.**
+
+This challenge needs the LangSmith key from Challenge 1."""),
+code(LS_SETUP + """
+from agents.research_agent import build_research_agent
+
+agent = build_research_agent()
+print("Ready")"""),
+md("""## 1. Generate traces
+
+Runs the research agent from `agents/research_agent.py` three times. Each
+prompt says "search at most once" to keep runs short. Each run is named
+`tracing-warmup` so it's easy to find."""),
+code("""warmup_prompts = [
+    "In one sentence, what is LangGraph for? Search at most once.",
+    "In one sentence, what does the LangChain v1 release add? Search at most once.",
+    "In one sentence, what is a deep agent? Search at most once.",
+]
+
+total = 0.0
+for q in warmup_prompts:
+    cfg = {"configurable": {"thread_id": str(uuid7())}, "run_name": "tracing-warmup"}
+    t0 = time.perf_counter()
+    result = agent.invoke({"messages": [{"role": "user", "content": q}]}, config=cfg)
+    elapsed = time.perf_counter() - t0
+    total += elapsed
+    print(f"[{elapsed:4.1f}s] {result['messages'][-1].text[:120]}")
+
+print(f"\\nTotal: {total:.1f}s ({total/len(warmup_prompts):.1f}s avg)")"""),
+md("""## 2. Your tracing project
+
+With `LANGSMITH_TRACING=true`, every model call, tool call, and state
+transition is recorded in your tracing project. No code changes."""),
+code("""project = client.read_project(project_name=PROJECT)
+print(f"Project: {project.name}")
+print(f"Traces:  {project.url}")"""),
+md("""## 3. Recent traces
+
+Useful filters on `client.list_runs(...)`:
+
+- `project_name=`: one project
+- `start_time=` / `end_time=`: a time window
+- `run_type=`: `"llm"`, `"tool"`, `"chain"`, `"retriever"`
+- `error=True`: failed runs only
+- `is_root=True`: top-level traces only, not their children
+- `filter=`: the filter DSL (latency, feedback, attributes, ...)"""),
+code("""since = datetime.now(timezone.utc) - timedelta(hours=1)
+
+recent_runs = list(client.list_runs(
+    project_name=PROJECT,
+    start_time=since,
+    is_root=True,
+    limit=20,
+))
+
+print(f"Found {len(recent_runs)} root run(s) in the last hour\\n")
+for r in recent_runs[:5]:
+    latency = (r.end_time - r.start_time).total_seconds() if r.end_time else None
+    print(f"- {r.id}  {r.name:25s}  latency={latency}s  error={r.error is not None}")"""),
+md("""## 4. Filter DSL: find slow runs
+
+The `filter` argument takes a small expression language:
+
+- `gt(latency, 5)`: slower than 5 seconds
+- `eq(status, "error")`: failed runs
+- `and(eq(feedback_key, "correctness"), lt(feedback_score, 0.5))`: low scores on one feedback key
+- Combine with `and(...)` / `or(...)`
+
+**The filter in the next cell is commented out**, so the query returns every
+root run.
+
+> **Uncomment the `filter=` line** to return only root runs slower than 5
+> seconds."""),
+code("""slow_runs = list(client.list_runs(
+    project_name=PROJECT,
+    start_time=since,
+    is_root=True,
+    # ------------------------------------------------------ YOUR TURN
+    # filter="gt(latency, 5)",
+    limit=20,
+))
+
+print(f"{len(slow_runs)} root run(s) returned")
+for r in slow_runs[:5]:
+    latency = (r.end_time - r.start_time).total_seconds() if r.end_time else None
+    print(f"  {r.name:25s}  {latency}s  {r.id}")""",
+     tags=["instruqt-blank-latency-filter"]),
+md("""Confirm the filter worked:"""),
+code("""too_fast = [r for r in slow_runs
+            if r.end_time and (r.end_time - r.start_time).total_seconds() <= 5]
+if too_fast:
+    raise ValueError(
+        f"{len(too_fast)} run(s) took 5s or less. Uncomment the filter line above and re-run it."
+    )
+
+mark_done("/tmp/.tracing-query-ok")
+print("Every run returned is slower than 5 seconds.")"""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms your three `tracing-warmup` traces are in
+LangSmith and that your filtered query ran."""),
+])
+
+# ---- challenge 12: Offline Evals (upstream module 4, Part 3a) ----
+# Blank: the trajectory evaluate() call's evaluators.
+write("12_offline_evals.ipynb", [
+md("""# Challenge 12 — Offline Evals 🦜
+
+Score the research agent against a fixed dataset, two ways: an LLM judge on
+the final response, and code that checks the tool-call trajectory.
+**One cell is blank and yours to finish.**
+
+This challenge needs the LangSmith key from Challenge 1.
+
+<img src="../images/evals-conceptual.png" style="width: auto; max-height: 400px; border-radius: 8px;">"""),
+code(LS_SETUP + """
+from typing import Any
+from typing_extensions import TypedDict
+from langchain_core.messages import SystemMessage, HumanMessage
+from utils.models import model
+from agents.research_agent import build_research_agent
+
+agent = build_research_agent()
+print("Ready")"""),
+md("""Offline evals run on demand against a fixed dataset. Re-run them after
+changing a prompt, model, or tool and compare the results.
+
+Three pieces:
+1. **Dataset**: labeled `inputs` and expected `outputs`
+2. **Target function**: runs the agent on each example
+3. **Evaluators**: score each output (LLM-as-judge or code)"""),
+md("""## 1. Dataset
+
+One set of inputs with two reference shapes: a rubric for final-response
+judging, and a tool-call list for trajectory matching. The name ends in your
+sandbox suffix; re-running the cell replaces your dataset, nobody else's."""),
+code("""examples = [
+    {
+        "inputs": {"query": "Write a haiku about Python to /haiku.txt"},
+        "outputs": {
+            "reference_answer": "A haiku about Python should be saved to /haiku.txt",
+            "trajectory": ["write_file"],
+        },
+    },
+    {
+        "inputs": {"query": "Research the latest AI agent frameworks and write a brief report to /report.md"},
+        "outputs": {
+            "reference_answer": "A short report on recent AI agent frameworks, written to /report.md",
+            "trajectory": ["task", "write_file"],
+        },
+    },
+    {
+        "inputs": {"query": "Write a short memo to /memo.md, then read it back to confirm"},
+        "outputs": {
+            "reference_answer": "A short memo written to /memo.md and read back",
+            "trajectory": ["write_file", "read_file"],
+        },
+    },
+    {
+        "inputs": {"query": "Plan out a small research project on LangSmith, then research it and write a report to /report.md"},
+        "outputs": {
+            "reference_answer": "A planned-out research report on LangSmith written to /report.md",
+            "trajectory": ["write_todos", "task", "write_file"],
+        },
+    },
+]
+
+dataset_name = f"modular-workshops-evals-{SFX}"
+
+if client.has_dataset(dataset_name=dataset_name):
+    existing = client.read_dataset(dataset_name=dataset_name)
+    client.delete_dataset(dataset_id=existing.id)
+    print(f"Deleted existing dataset '{dataset_name}'")
+
+dataset = client.create_dataset(dataset_name)
+client.create_examples(
+    inputs=[e["inputs"] for e in examples],
+    outputs=[e["outputs"] for e in examples],
+    dataset_id=dataset.id,
+)
+print(f"Created dataset '{dataset_name}' with {len(examples)} examples")
+print(f"View: {dataset.url}")"""),
+md("""## 2. Final-response eval (LLM-as-judge)
+
+<img src="../images/final-response.png" style="width: auto; max-height: 280px; border-radius: 8px;">
+
+Treat the agent as a black box: did the final response satisfy the request?
+The judge is built from four parts:
+
+1. A `TypedDict` schema for the judge's output (`score`, `reasoning`)
+2. A judge prompt with the grading criteria
+3. `model.with_structured_output(...)` to make the model return that schema
+4. An evaluator function that returns the score in the shape `client.evaluate` expects"""),
+code('''def run_agent_final(inputs: dict) -> dict:
+    """Run the agent and return its reply plus any files it wrote."""
+    config = {"configurable": {"thread_id": str(uuid7())}}
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": inputs["query"]}]},
+        config=config,
+    )
+    return {
+        "response": result["messages"][-1].text,
+        "files": result.get("files") or {},
+    }'''),
+code('''class CorrectnessGrade(TypedDict):
+    """Score whether the agent's response satisfied the user's request."""
+    score: bool      # True if correct/helpful
+    reasoning: str   # one-sentence explanation
+
+# `reference_answer` is a success rubric, not expected text. Say so, so the
+# judge doesn't mark down correct answers that are worded differently.
+correctness_judge_prompt = """You are an expert grader evaluating an AI assistant.
+
+You will see:
+1. The user's request
+2. The assistant's final response
+3. Any files written by the assistant
+4. A success rubric
+
+Evaluate both the response and the files. If the task asks the assistant to write a file, inspect the file contents when available. Mark `score=True` if the task was completed successfully, even if the wording differs from the rubric.
+
+Mark `score=False` only if the task was clearly missed, the file is missing or incorrect, the response contains errors, or the assistant refused without good reason.
+
+Give one short sentence of reasoning.
+"""
+
+judge = model.with_structured_output(CorrectnessGrade)
+
+def correctness_evaluator(inputs, outputs, reference_outputs):
+    grade = judge.invoke([
+        SystemMessage(content=correctness_judge_prompt),
+        HumanMessage(content=(
+            f"User request: {inputs['query']}\\n\\n"
+            f"Assistant response: {outputs['response']}\\n\\n"
+            f"Files written: {outputs.get('files', {})}\\n\\n"
+            f"Success rubric: {reference_outputs['reference_answer']}"
+        )),
+    ])
+    return {
+        "key": "correctness",
+        "score": int(grade["score"]),
+        "comment": grade["reasoning"],
+    }'''),
+md("""Runs the agent on all four examples, two at a time. Takes a few minutes."""),
+code("""results = client.evaluate(
+    run_agent_final,
+    data=dataset_name,
+    evaluators=[correctness_evaluator],
+    experiment_prefix="final-response",
+    max_concurrency=2,
+)
+print(f"Experiment: {results.experiment_name}")"""),
+md("""## 3. Trajectory eval
+
+<img src="../images/trajectory.png" style="width: auto; max-height: 280px; border-radius: 8px;">
+
+Scores the **sequence of tool calls**, not the final answer. Three
+evaluators:
+
+- **`exact_match`**: the right steps, in order
+- **`extra_steps`**: how many tool calls beyond the reference
+- **`missing_steps`**: how many reference steps were skipped
+
+`extra_steps` and `missing_steps` compare multisets with
+`collections.Counter`, so order doesn't matter for them. `exact_match` still
+catches ordering errors."""),
+code("""from collections import Counter
+
+def trajectory_match(outputs, reference_outputs):
+    return {
+        "key": "exact_match",
+        "score": int(outputs["trajectory"] == reference_outputs["trajectory"]),
+    }
+
+def extra_steps(outputs, reference_outputs):
+    extras = Counter(outputs["trajectory"]) - Counter(reference_outputs["trajectory"])
+    return {"key": "extra_steps", "score": sum(extras.values())}
+
+def missing_steps(outputs, reference_outputs):
+    missing = Counter(reference_outputs["trajectory"]) - Counter(outputs["trajectory"])
+    return {"key": "missing_steps", "score": sum(missing.values())}"""),
+md("""The target function returns the tool-call names in order."""),
+code('''def extract_tool_calls(messages: list[Any]) -> list[str]:
+    """Tool-call names from messages, in order."""
+    tool_names = []
+    for msg in messages:
+        if getattr(msg, "tool_calls", None):
+            tool_names.extend(tc["name"] for tc in msg.tool_calls)
+    return tool_names
+
+def run_agent_trajectory(inputs: dict) -> dict:
+    config = {"configurable": {"thread_id": str(uuid7())}}
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": inputs["query"]}]},
+        config=config,
+    )
+    return {"trajectory": extract_tool_calls(result["messages"])}'''),
+md("""**The `evaluate` call below has no evaluators**, so it would run the agent
+and score nothing.
+
+> **Uncomment the `evaluators=[...]` line** to pass the three trajectory
+> evaluators defined above."""),
+code("""results = client.evaluate(
+    run_agent_trajectory,
+    data=dataset_name,
+    # ------------------------------------------------------ YOUR TURN
+    # evaluators=[trajectory_match, extra_steps, missing_steps],
+    experiment_prefix="trajectory",
+    max_concurrency=2,
+)
+print(f"Experiment: {results.experiment_name}")""",
+     tags=["instruqt-blank-trajectory-evaluators"]),
+md("""Open **Datasets & Experiments** in LangSmith and select your dataset to
+compare the two experiments side by side."""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms your dataset exists and has a `trajectory`
+experiment with `exact_match` scores."""),
+])
+
+# ---- challenge 13: Environment Evals (upstream module 4, Part 3b) ----
+# No blank. Graded on the local agent run + verifier (3 cells, no Harbor
+# needed); the Harbor job itself is optional. No LangSmith key needed except
+# for the Harbor job's LangSmith plugin.
+write("13_environment_evals.ipynb", [
+md("""# Challenge 13 — Environment Evals 🦜
+
+Run the agent in a sandbox and grade the files it leaves behind, including
+re-running code it wrote.
+
+The local run and verifier work in this sandbox. The Harbor job at the end
+needs **LangSmith Sandboxes** enabled for your workspace, and is optional."""),
+code("""import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+for path in ("/root/workshop", "/root/workshop/instruqt"):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from dotenv import load_dotenv
+
+load_dotenv("/root/workshop/.env", override=True)
+
+from utils.models import model
+from utils.harbor_utils import seed_workspace, print_tree
+from langsmith import uuid7
+from lab_state import mark_done
+
+project_root = Path("/root/workshop")
+NOTEBOOK_DIR = Path.cwd()
+VENV_BIN = Path(sys.executable).parent
+SFX = os.environ["WORKSHOP_SFX"]
+task_dir = project_root / "environment_evals" / "dataset" / "noise-pollution-report"
+
+print("Ready")"""),
+md("""In Challenge 12 the agent ran as a function and returned a value to score.
+Here it writes a report and a Python script. Checking the report means running
+that script, so the agent and the verifier need an isolated process.
+[Harbor](https://www.harborframework.com/) provides the isolation and runs the
+evaluation.
+
+Harbor's terms:
+
+- **Task**: an instruction, an environment, and a verifier
+- **Environment**: the sandbox the agent runs in
+- **Verifier**: the script that grades the agent's files
+- **Trial**: one agent attempt at one task
+- **Job**: a batch of trials across a set of tasks
+
+Each directory under `environment_evals/dataset/` is one task. The four
+topics share one structure and verifier:
+
+```
+noise-pollution-report/
+├── task.toml                     <- timeouts, network policy, TOPIC_FILE
+├── instruction.md                <- the prompt handed to the agent
+├── environment/
+│   ├── Dockerfile                <- builds the sandbox
+│   └── info/*.md                 <- the seeded knowledge base
+├── solution/solve.sh             <- oracle: sanity-checks the verifier
+└── tests/
+    ├── test.sh                   <- entry point Harbor runs after the agent stops
+    └── verify.py                 <- grades the report, re-runs the agent's script
+```"""),
+md("""### From evaluation to training
+
+A programmatic verifier produces a **reward**, so the same task format serves
+evaluation, reinforcement learning, or rejection-sampled fine-tuning. Harbor
+also records each trial's full trajectory.
+
+Two properties matter for training:
+
+- **Partial credit.** Seven checks show which requirements passed, not one pass/fail.
+- **Multiple instances.** The four topics have different correct counts, so success depends on the procedure, not a memorized answer. A training set would have many more.
+
+### Distinct URLs, not occurrences
+
+Each source file cites references inline and again under `## Sources`, so a URL
+appears more than once. The task asks for the number of **distinct** sources.
+
+| `noise_pollution.md` | |
+|---|---|
+| URL occurrences | 7 |
+| **Distinct** URLs | **3** |
+
+- `len(re.findall(URL_RE, text))` returns **7** occurrences.
+- `len(set(re.findall(URL_RE, text)))` returns **3** distinct URLs.
+
+Both are valid Python. Only the second meets the requirement."""),
+md("""## 1. The agent under test
+
+The research agent with one more requirement: write `sources.py` so the source
+count can be reproduced. In a Harbor trial, the graph loads from
+`environment_evals/deep-agent/agent.py` inside the container."""),
+code('''from deepagents import create_deep_agent
+from deepagents.backends import LocalShellBackend
+
+REPORT_SYSTEM_PROMPT = """You are a research assistant that writes short reports from a local markdown knowledge base.
+
+Your working directory has two folders:
+  - `info/`   : source material, one markdown file per topic.
+  - `report/` : where you MUST save the report.
+
+Read the matching file in `info/`, then write a report to `report/` whose body is exactly
+THREE paragraphs, followed by a `## Sources` section listing the reference URLs from that file.
+If the request asks for a figure derived from the source material, put the calculation in
+`sources.py` at the workspace root and run it. Use plain relative paths inside that script
+(e.g. `info/topic.md`) so it still runs on its own.
+"""
+
+def build_report_agent():
+    return create_deep_agent(
+        model=model,
+        system_prompt=REPORT_SYSTEM_PROMPT,
+        backend=LocalShellBackend(root_dir=".", virtual_mode=False),
+    )'''),
+md("""## 2. Run it locally
+
+Runs the agent in a scratch workspace, `/root/workshop/.dev-workspace`, seeded
+with the files the task's Dockerfile copies into its container."""),
+code("""workspace = seed_workspace(task_dir / "environment", project_root / ".dev-workspace")
+
+instruction = (task_dir / "instruction.md").read_text()
+run_config = {"configurable": {"thread_id": str(uuid7())}}
+
+# The backend is rooted at ".", so the agent runs from inside the workspace.
+os.chdir(workspace)
+try:
+    report_agent = build_report_agent()
+    agent_result = report_agent.invoke(
+        {"messages": [{"role": "user", "content": instruction}]},
+        config=run_config,
+    )
+finally:
+    os.chdir(NOTEBOOK_DIR)
+
+reports = sorted((workspace / "report").glob("*.md"))
+report_text = reports[0].read_text() if reports else "(none written)"
+
+sources_py = workspace / "sources.py"
+sources_text = sources_py.read_text() if sources_py.exists() else "(not written)"
+
+print("=== report ===")
+print(report_text)
+print("\\n=== sources.py ===")
+print(sources_text)"""),
+md("""## 3. The verifier
+
+The verifier returns seven check scores and their average. Four cover report
+structure and citations. A fifth compares the count stated in the report with
+one derived from the source file. The last two delete the report, re-run
+`sources.py`, and check its exit status and output. It's an exact check, so it
+needs no LLM judge.
+
+The excerpt below shows the checks. The full file,
+`environment_evals/dataset/noise-pollution-report/tests/verify.py`, also
+handles path validation, file discovery, errors, and logging.
+
+```python
+files = report_files()
+prose = read(files[0]) if files else ""
+body, sources = split_body_and_sources(prose)
+
+# Derive the expected answer from the source file, not the agent's output.
+topic_path = resolve_under(INFO, TOPIC_FILE)
+true_count = len(set(URL_RE.findall(read(topic_path))))
+
+scores = {
+    "report_written": float(bool(files)),
+    "three_paragraphs": float(len(paragraphs(body)) == 3),
+    "sources_section": float(bool(sources.strip())),
+    "grounded_in_kb": float(any(url in prose for url in knowledge_base_urls())),
+    "report_ties_to_code": float(states_count(prose, true_count)),
+}
+
+# Delete the report, then rerun the agent's script from a clean state.
+for file in files:
+    file.unlink(missing_ok=True)
+
+completed = subprocess.run(
+    ["python3", "sources.py"],
+    cwd=str(WORKDIR),
+    capture_output=True,
+    text=True,
+    timeout=60,
+)
+scores["script_reproduces"] = float(completed.returncode == 0)
+scores["count_correct"] = float(
+    bool(re.search(rf"\\b{true_count}\\b", completed.stdout))
+)
+scores["reward"] = round(sum(scores.values()) / len(scores), 4)
+```
+
+Harbor runs this file after the agent stops. `HARBOR_WORKDIR` points it at the
+local scratch workspace instead. It deletes the report as part of grading, so
+re-run step 2 before running it again."""),
+code("""verifier_env = {
+    **os.environ,
+    "HARBOR_WORKDIR": str(workspace),
+    "HARBOR_LOGS": str(workspace / "logs"),
+    "TOPIC_FILE": "noise_pollution.md",
+}
+
+completed = subprocess.run(
+    [sys.executable, str(task_dir / "tests" / "verify.py")],
+    env=verifier_env,
+    capture_output=True,
+    text=True,
+)
+print(completed.stdout)
+
+if completed.returncode == 0:
+    mark_done("/tmp/.env-eval-verified")
+else:
+    print(completed.stderr)"""),
+md("""The verifier tells these two implementations apart:
+
+| `sources.py` | counts | reward |
+|---|---|---|
+| `len(re.findall(URL_RE, text))` | every occurrence | **0.714** |
+| `len(set(re.findall(URL_RE, text)))` | distinct URLs | **1.000** |
+
+Both scripts run, so both pass `script_reproduces`. Only the distinct-URL
+version passes `count_correct` and `report_ties_to_code`. Re-computing the
+answer catches errors the finished report alone doesn't show."""),
+md("""## 4. The task files
+
+`verify.py` holds the grading logic. The rest configures the task and its
+environment.
+
+`task.toml`: metadata, timeouts, and verifier environment variables.
+`TOPIC_FILE` lets one verifier serve all four tasks."""),
+code("""print((task_dir / "task.toml").read_text())"""),
+md("""`environment/Dockerfile`: copies the knowledge base into the sandbox and
+creates an empty `report/`."""),
+code("""print((task_dir / "environment" / "Dockerfile").read_text())"""),
+md("""`instruction.md`: the task prompt and the reproducibility requirement."""),
+code("""print((task_dir / "instruction.md").read_text())"""),
+md("""The four tasks differ only in topic and source files:"""),
+code("""print_tree(project_root / "environment_evals" / "dataset")"""),
+md("""## 5. Run the Harbor job (optional, not graded)
+
+The job connects three pieces:
+
+- **LangSmith Sandboxes**: `--env langsmith` runs the container on LangSmith infrastructure instead of local Docker.
+- **Deep Agents**: `--agent langgraph` loads a graph from `langgraph.json`.
+- **LangSmith evaluations**: `--plugin langsmith` records the job as a dataset and experiment, the same objects as Challenge 12.
+
+Needs the LangSmith key from Challenge 1 and **LangSmith Sandboxes** enabled
+for your workspace. Set `RUN_HARBOR = True` in the next cell to run it.
+
+The oracle runs first: a hand-written solution that should score
+`reward: 1.0` on every task. Anything lower means the task or verifier is
+misconfigured."""),
+code("""RUN_HARBOR = False  # set to True if LangSmith Sandboxes are enabled
+
+if RUN_HARBOR and not os.environ.get("LANGSMITH_API_KEY"):
+    raise SystemExit("The Harbor job needs a LangSmith key. Enter one in 01_setup.ipynb.")
+
+if RUN_HARBOR:
+    !cd "{project_root}" && "{VENV_BIN}/harbor" run -p environment_evals/dataset -a oracle --env langsmith -y
+else:
+    print("Skipped. Set RUN_HARBOR = True to run the oracle.")"""),
+md("""Then the agent on all four tasks. A score below `1.0` shows which checks
+failed.
+
+The model comes from `MODEL_SPEC` in `utils/models.py` (Claude on Bedrock
+here), passed to the container through Harbor's config channel. The
+container calls Bedrock with **this sandbox's AWS credentials**, passed in
+with `--ae`. They're temporary and scoped to Bedrock."""),
+code("""from utils.models import MODEL_SPEC
+
+HARBOR_DATASET = f"environment-evals-reports-{SFX}"
+HARBOR_EXPERIMENT = f"research-reports-{SFX}"
+
+spec = dict(MODEL_SPEC)
+model_name = spec.pop("model")
+aws_env = " ".join(
+    f'--ae {k}="${k}"'
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION")
+)
+
+harbor_cmd = " ".join([
+    f'cd "{project_root}" && "{VENV_BIN}/harbor" run',
+    "-p environment_evals/dataset",
+    "--agent langgraph",
+    "--ak project_path=./environment_evals/deep-agent",
+    "--ak graph=deep_agent",
+    f"--model {model_name}",
+    f"--ak model_kwargs='{json.dumps(spec)}'",
+    aws_env,
+    "--env langsmith",
+    "--plugin langsmith",
+    f"--pk dataset_name={HARBOR_DATASET}",
+    f"--pk experiment_name={HARBOR_EXPERIMENT}",
+    "-y",
+])
+print(harbor_cmd)"""),
+code("""if RUN_HARBOR:
+    !{harbor_cmd}
+else:
+    print("Skipped. Set RUN_HARBOR = True to run the job.")"""),
+md("""The LangSmith plugin records the job as a dataset and an experiment. Its
+trials and scores come back through `list_runs` and `list_feedback`, the same
+calls as Challenge 11."""),
+code("""if RUN_HARBOR:
+    from langsmith import Client
+
+    client = Client()
+    harbor_dataset = client.read_dataset(dataset_name=HARBOR_DATASET)
+    harbor_experiment = client.read_project(project_name=HARBOR_EXPERIMENT)
+
+    print(f"Dataset:    {harbor_dataset.url}")
+    print(f"Experiment: {harbor_experiment.url}\\n")
+
+    for trial in client.list_runs(project_name=HARBOR_EXPERIMENT, is_root=True):
+        feedback = client.list_feedback(run_ids=[trial.id])
+        scores = {f.key: f.score for f in feedback}
+        print(f"  {trial.name:34s} reward={scores.get('reward')}")
+else:
+    print("Skipped: no Harbor job ran.")"""),
+md("""In **Datasets & Experiments**, open the Harbor dataset. Each trial is a row
+and each of the seven reward keys is a feedback column, the same view as
+Challenge 12's scores."""),
+md("""---
+## Next: Check
+
+Click **Check**. It confirms the local agent run (step 2) and the verifier
+(step 3) ran. The Harbor job isn't graded."""),
+])
+
+# ---- challenge 14: Online Evals & Annotation Queues (upstream module 4, Part 4) ----
+# Blank: the online rule's root-only filter, which the Check reads back from
+# the rule itself.
+write("14_online_evals.ipynb", [
+md("""# Challenge 14 — Online Evals & Annotation Queues 🦜
+
+Score every new trace automatically, then route scored runs to a queue for
+human review. **One cell is blank and yours to finish.**
+
+This challenge needs the LangSmith key from Challenge 1."""),
+code(LS_SETUP + """
+from utils.langsmith_rules import (
+    get_or_create_annotation_queue,
+    create_run_rule,
+    delete_run_rule,
+)
+from agents.research_agent import build_research_agent
+
+agent = build_research_agent()
+print("Ready")"""),
+md("""**Online evals** score each new trace as it arrives in your tracing project:
+the same kind of evaluator as Challenge 12, triggered by incoming runs instead
+of a dataset.
+
+LangSmith calls these **run rules**. The SDK doesn't wrap them, so
+`utils/langsmith_rules.py` calls the REST endpoint. Pass a project, a judge
+prompt, and an output schema; get back the rule ID and a link to it.
+
+> The judge runs inside LangSmith, not in this sandbox. It uses the
+> `OPENAI_API_KEY` secret in your workspace (**Settings → Secrets**). Without
+> that secret the rule is still created, but no scores appear."""),
+md("""## 1. Online eval rule
+
+A rule with no filter scores every run in the project, including each model
+call, tool call, and middleware step inside a trace. **The filter in the next
+cell is commented out.**
+
+> **Uncomment the `filter=` line** so the rule scores root traces only."""),
+code("""judge_prompt = (
+    "You score whether an assistant response satisfied the user's request.\\n"
+    "Reply with correctness (true/false) and one sentence of comment explaining why."
+)
+
+judge_schema = {
+    "title": "correctness",
+    "description": "Score whether the assistant response was correct/helpful.",
+    "type": "object",
+    "properties": {
+        "correctness": {"type": "boolean", "description": "True if the response was correct/helpful"},
+        "comment": {"type": "string", "description": "One short sentence explaining the score"},
+    },
+    "required": ["correctness", "comment"],
+    "strict": True,
+}
+
+online_rule = create_run_rule(
+    client,
+    project_name=PROJECT,
+    display_name="workshop-online-correctness",
+    sampling_rate=1.0,
+    # ------------------------------------------------------ YOUR TURN
+    # filter="eq(is_root, true)",
+    llm_judge_prompt=judge_prompt,
+    llm_judge_schema=judge_schema,
+)
+
+print("Rule ID:", online_rule["id"])
+print("Open:   ", online_rule["url"])""",
+     tags=["instruqt-blank-root-filter"]),
+md("""## 2. Annotation queue
+
+Once runs have feedback scores, route the ones you want a person to review
+into an **annotation queue**. The queue name ends in your sandbox suffix."""),
+code("""queue = get_or_create_annotation_queue(
+    client,
+    name=f"modular-workshops-needs-review-{SFX}",
+    description="Runs routed here by the workshop's correctness automation rule.",
+)
+print(f"Queue: {queue.name} (id={queue.id})")"""),
+md("""## 3. Routing rule
+
+The same `create_run_rule` helper, with `add_to_annotation_queue_id` instead
+of a judge. Every run matching the filter is added to the queue."""),
+code("""# Filter: root traces with a correctness score above 0.5.
+queue_rule = create_run_rule(
+    client,
+    project_name=PROJECT,
+    display_name="workshop-route-correctness",
+    sampling_rate=1.0,
+    filter=(
+        "and("
+        "eq(is_root, true), "
+        'eq(feedback_key, "correctness"), '
+        "gt(feedback_score, 0.5)"
+        ")"
+    ),
+    add_to_annotation_queue_id=queue.id,
+)
+
+print("Queue rule ID:", queue_rule["id"])
+print("Open:         ", queue_rule["url"])"""),
+md("""## 4. Trigger both rules
+
+The cell waits 100 seconds for both rules to become active, then runs three
+short traces:
+
+1. The online eval scores each new trace and attaches `correctness` feedback (about 30 seconds later).
+2. The queue rule fires on each new matching feedback score and adds the run to the queue."""),
+code("""trigger_prompts = [
+    "In one sentence, what is LangSmith? Search at most once.",
+    "In one sentence, what does `create_agent` do in LangChain v1? Search at most once.",
+    "In one sentence, what is the difference between LangChain and LangGraph? Search at most once.",
+]
+
+time.sleep(100)
+
+total = 0.0
+for q in trigger_prompts:
+    cfg = {"configurable": {"thread_id": str(uuid7())}}
+    t0 = time.perf_counter()
+    result = agent.invoke({"messages": [{"role": "user", "content": q}]}, config=cfg)
+    elapsed = time.perf_counter() - t0
+    total += elapsed
+    print(f"[{elapsed:4.1f}s] {result['messages'][-1].text[:120]}")
+
+tenant_id = queue_rule["payload"]["tenant_id"]
+
+print(f"\\nTotal: {total:.1f}s.")
+print(f"\\nOnline eval rule: {online_rule['url']}")
+print(f"Queue rule:       {queue_rule['url']}")
+print(f"Queue (review):   {UI}/o/{tenant_id}/annotation-queues/{queue.id}")
+print("\\nScores appear on the rule pages within ~30s; queue entries follow.")"""),
+md("""### Common run-rule filters
+
+| Use case | `filter` |
+|---|---|
+| Low online correctness | `and(eq(feedback_key, "correctness"), lt(feedback_score, 0.5))` |
+| Errored runs | `eq(status, "error")` |
+| Slow runs | `gt(latency, 10)` |
+| Long-running tool calls | `and(eq(run_type, "tool"), gt(latency, 3))` |
+| A specific tool fired | `eq(name, "web_search")` |"""),
+md("""## Recap: LangSmith
+
+| Challenge | What | API |
+|---|---|---|
+| **10. Prompts** | Author, version, and share prompts; pull them into code | `client.push_prompt(...)` / `client.pull_prompt(...)` |
+| **11. Tracing** | Capture every run; query by filter | `LANGSMITH_TRACING=true`, `client.list_runs(filter=...)` |
+| **12. Offline evals** | Score against a dataset on demand | `model.with_structured_output(...)` + `client.evaluate` |
+| **13. Environment evals** | Run in a sandbox; grade the files, re-run the agent's code | `harbor run --env langsmith --plugin langsmith` |
+| **14. Online evals** | Score every new trace | `create_run_rule(..., llm_judge_prompt=..., llm_judge_schema=...)` |
+| **14. Annotation queues** | Route runs for human review | `create_run_rule(..., add_to_annotation_queue_id=...)` |
+
+The loop: trace → online eval scores it → a run rule routes it to a queue →
+a person reviews → fixes go into the next dataset."""),
+md("""---
+## Next: Check
+
+Click **Check**. It reads both run rules from your tracing project, and
+confirms the online rule scores root traces only."""),
+md("""## Clean up (after the Check passes)
+
+The rules keep scoring every new trace in your project until deleted."""),
+code("""delete_run_rule(client, online_rule["id"])
+delete_run_rule(client, queue_rule["id"])
+print("Both run rules deleted.")"""),
+])
+
+GENEOF
+"$VENV_PY" "${OPS_DIR}/gen_notebooks.py"
+
+# ---- shared credential seeder (used by solve scripts) ----
+# `instruqt track test` never types into a getpass prompt, so solves call this
+# instead of driving the prompt. Full-chain defensive: any solve may call it at
+# any challenge, which matters because skipping_enabled is on.
+cat > "${OPS_DIR}/seed_credentials.py" <<'SEEDEOF'
+"""Reproduce the state challenge 1's getpass cell produces.
+
+Two modes, and the difference matters:
+
+  SOLVE_LANGSMITH_API_KEY present -> the real key is stored and tracing is on,
+    so the Checks read the run back from LangSmith.
+  absent -> no key and tracing off, exactly as a learner who pressed Enter at
+    the prompt. The Checks then read the local trace files utils/models.py
+    writes instead. See MEMORY.md.
+
+BUT: a key the LEARNER already entered always wins over both of those. Skipping
+a challenge runs its solve as root, and every solve calls this seeder
+defensively -- so without that rule, a learner who entered a real key and later
+pressed Skip would silently lose it.
+
+Values arrive as Instruqt runtime parameters, which are injected under their own
+name and are NOT persisted into the VM — they exist only for the duration of the
+lifecycle script. Idempotent: rewrites the same keys, leaves other lines alone.
+"""
+import os
+from pathlib import Path
+
+ENV = Path("/opt/workshop/.env")
+
+lines = ENV.read_text().splitlines() if ENV.exists() else []
+
+
+def stored(name):
+    """Current value of `name` in .env, or "" if absent. Never printed."""
+    for line in reversed(lines):
+        k, _, v = line.partition("=")
+        if k == name:
+            return v.strip()
+    return ""
+
+
+def learner_key(name, prefix):
+    v = stored(name)
+    return v if v.startswith(prefix) else ""
+
+ls_real = os.environ.get("SOLVE_LANGSMITH_API_KEY", "").strip()
+
+ls_kept = learner_key("LANGSMITH_API_KEY", "lsv2_")
+
+# Region endpoint. Same precedence as the keys: a learner's detected endpoint
+# always wins, so a Skip cannot silently move an EU learner back to the US API.
+# Deliberately NOT re-probing the network here -- this seeder runs inside every
+# solve, and four possible auth round-trips per solve would eat the lifecycle
+# script's time budget. A test run against a non-US key passes the endpoint in
+# explicitly as SOLVE_LANGSMITH_ENDPOINT.
+DEFAULT_ENDPOINT = "https://api.smith.langchain.com"
+ep_kept = stored("LANGSMITH_ENDPOINT")
+ep_real = os.environ.get("SOLVE_LANGSMITH_ENDPOINT", "").strip()
+
+remove = []
+if ls_kept or ls_real:
+    updates = {
+        "LANGSMITH_API_KEY": ls_kept or ls_real,
+        "LANGSMITH_TRACING": "true",
+        "LANGSMITH_ENDPOINT": ep_kept or ep_real or DEFAULT_ENDPOINT,
+    }
+else:
+    updates = {"LANGSMITH_TRACING": "false"}
+    remove = ["LANGSMITH_API_KEY", "LANGSMITH_ENDPOINT"]
+drop = set(updates) | set(remove)
+kept = [l for l in lines if l.split("=", 1)[0] not in drop]
+body = "\n".join(kept + [f"{k}={v}" for k, v in updates.items()]) + "\n"
+fd = os.open(str(ENV), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(body)
+# O_CREAT's mode applies only on creation, and .env always already exists here,
+# so enforce the permission explicitly rather than assuming it carried over.
+os.chmod(str(ENV), 0o600)
+
+# Report only WHICH SOURCE won, never any part of any value.
+def source(kept, supplied):
+    if kept:
+        return "kept-learner-key"
+    return "solve-key" if supplied else "absent"
+
+
+print("seed_credentials: langsmith=%s endpoint=%s" % (
+    source(ls_kept, ls_real),
+    (source(ep_kept, ep_real) if (ep_kept or ep_real) else "default-us")
+    if (ls_kept or ls_real) else "none"))
+SEEDEOF
+
+# ---- challenge 2 blanked-cell filler (learner pastes create_deep_agent) ----
+cat > "${OPS_DIR}/fill_challenge2_blank.py" <<'FILL2EOF'
+"""Write /tmp/02_your_first_deep_agent.solved.ipynb with the blanked cell
+completed. The filled cell is the exact create_deep_agent() call the
+assignment instructs the learner to paste in. Idempotent: re-running
+overwrites the output."""
+import json
+import sys
+from pathlib import Path
+
+SRC = Path("/opt/workshop/instruqt/02_your_first_deep_agent.ipynb")
+DST = Path("/tmp/02_your_first_deep_agent.solved.ipynb")
+TAG = "instruqt-blank-first-deep-agent"
+
+SOLUTION = '''from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    model=model,
+    system_prompt="You are a helpful assistant.",
+    checkpointer=MemorySaver(),
+)
+agent
+'''
+
+nb = json.loads(SRC.read_text())
+filled = 0
+for cell in nb["cells"]:
+    if TAG in (cell.get("metadata") or {}).get("tags", []):
+        cell["source"] = SOLUTION.splitlines(keepends=True)
+        filled += 1
+
+if filled != 1:
+    sys.exit(f"expected exactly 1 cell tagged {TAG!r}, found {filled}")
+
+DST.write_text(json.dumps(nb, indent=1))
+print(f"filled 1 blanked cell -> {DST}")
+FILL2EOF
+
+# ---- challenge 3 blanked-cell filler (learner uncomments tools/subagents) ----
+cat > "${OPS_DIR}/fill_challenge3_blank.py" <<'FILL3EOF'
+"""Write /tmp/03_custom_tools_and_subagents.solved.ipynb with the blanked cell
+completed. The filled cell is the same create_deep_agent() call with both
+commented-out lines uncommented. Idempotent: re-running overwrites the output."""
+import json
+import sys
+from pathlib import Path
+
+SRC = Path("/opt/workshop/instruqt/03_custom_tools_and_subagents.ipynb")
+DST = Path("/tmp/03_custom_tools_and_subagents.solved.ipynb")
+TAG = "instruqt-uncomment-tools-subagents"
+
+SOLUTION = '''agent = create_deep_agent(
+    model=model,
+    system_prompt=f"You are a helpful research assistant. Today is {datetime.now():%Y-%m-%d}.",
+    tools=[web_search],
+    subagents=[research_subagent],
+    checkpointer=MemorySaver(),
+)
+agent
+'''
+
+nb = json.loads(SRC.read_text())
+filled = 0
+for cell in nb["cells"]:
+    if TAG in (cell.get("metadata") or {}).get("tags", []):
+        cell["source"] = SOLUTION.splitlines(keepends=True)
+        filled += 1
+
+if filled != 1:
+    sys.exit(f"expected exactly 1 cell tagged {TAG!r}, found {filled}")
+
+DST.write_text(json.dumps(nb, indent=1))
+print(f"filled 1 blanked cell -> {DST}")
+FILL3EOF
+
+# ---- challenge 4 blanked-cell filler (learner uncomments + replaces prompt) ----
+cat > "${OPS_DIR}/fill_challenge4_blank.py" <<'FILL4EOF'
+"""Write /tmp/04_backends_and_memory.solved.ipynb with the blanked cell
+completed: backend=/store= uncommented, system_prompt replaced with the one
+the assignment instructs the learner to paste in. Idempotent: re-running
+overwrites the output."""
+import json
+import sys
+from pathlib import Path
+
+SRC = Path("/opt/workshop/instruqt/04_backends_and_memory.ipynb")
+DST = Path("/tmp/04_backends_and_memory.solved.ipynb")
+TAG = "instruqt-fill-backend-memory"
+
+SOLUTION = '''agent = create_deep_agent(
+    model=model,
+    tools=[web_search],
+    system_prompt=(
+        "You are a helpful assistant. Save important facts to /memories/ for future reference. "
+        "ALWAYS check /memories files before answering any questions to ensure you don't miss relevant information."
+    ),
+    subagents=[research_subagent],
+    backend=backend,
+    store=store,
+    checkpointer=MemorySaver(),
+)
+agent
+'''
+
+nb = json.loads(SRC.read_text())
+filled = 0
+for cell in nb["cells"]:
+    if TAG in (cell.get("metadata") or {}).get("tags", []):
+        cell["source"] = SOLUTION.splitlines(keepends=True)
+        filled += 1
+
+if filled != 1:
+    sys.exit(f"expected exactly 1 cell tagged {TAG!r}, found {filled}")
+
+DST.write_text(json.dumps(nb, indent=1))
+print(f"filled 1 blanked cell -> {DST}")
+FILL4EOF
+
+# ---- challenge 5 blanked-cell filler (learner uncomments middleware/HITL) ----
+cat > "${OPS_DIR}/fill_challenge5_blank.py" <<'FILL5EOF'
+"""Write /tmp/05_middleware_and_hitl.solved.ipynb with the blanked cell
+completed: middleware= and interrupt_on= uncommented. Idempotent: re-running
+overwrites the output."""
+import json
+import sys
+from pathlib import Path
+
+SRC = Path("/opt/workshop/instruqt/05_middleware_and_hitl.ipynb")
+DST = Path("/tmp/05_middleware_and_hitl.solved.ipynb")
+TAG = "instruqt-uncomment-middleware-hitl"
+
+SOLUTION = '''agent = create_deep_agent(
+    model=model,
+    tools=[web_search],
+    system_prompt=(
+        "You are a helpful assistant. Save important facts to /memories/ for future reference. "
+        "ALWAYS check /memories files before answering any questions to ensure you don't miss relevant information."
+    ),
+    subagents=[research_subagent],
+    backend=backend,
+    store=store,
+    middleware=[compliance_rules, audit_trail],
+    interrupt_on={
+        "write_file": True,
+        "edit_file": True,
+    },
+    checkpointer=MemorySaver(),
+)
+agent
+'''
+
+nb = json.loads(SRC.read_text())
+filled = 0
+for cell in nb["cells"]:
+    if TAG in (cell.get("metadata") or {}).get("tags", []):
+        cell["source"] = SOLUTION.splitlines(keepends=True)
+        filled += 1
+
+if filled != 1:
+    sys.exit(f"expected exactly 1 cell tagged {TAG!r}, found {filled}")
+
+DST.write_text(json.dumps(nb, indent=1))
+print(f"filled 1 blanked cell -> {DST}")
+FILL5EOF
+
+# ---- challenge 6 blanked-cell filler (learner comments out system_prompt, uncomments memory/skills) ----
+cat > "${OPS_DIR}/fill_challenge6_blank.py" <<'FILL6EOF'
+"""Write /tmp/06_agents_and_skills.solved.ipynb with the blanked cell
+completed: system_prompt commented out, memory= and skills= uncommented.
+Idempotent: re-running overwrites the output."""
+import json
+import sys
+from pathlib import Path
+
+SRC = Path("/opt/workshop/instruqt/06_agents_and_skills.ipynb")
+DST = Path("/tmp/06_agents_and_skills.solved.ipynb")
+TAG = "instruqt-uncomment-agents-skills"
+
+SOLUTION = '''agent = create_deep_agent(
+    model=model,
+    tools=[web_search],
+    subagents=[research_subagent],
+    backend=backend,
+    store=store,
+    middleware=[compliance_rules, audit_trail],
+    interrupt_on={
+        "write_file": True,
+        "edit_file": True,
+    },
+    checkpointer=MemorySaver(),
+    memory=["/AGENTS.md"],
+    skills=["/skills/"],
+)
+agent
+'''
+
+nb = json.loads(SRC.read_text())
+filled = 0
+for cell in nb["cells"]:
+    if TAG in (cell.get("metadata") or {}).get("tags", []):
+        cell["source"] = SOLUTION.splitlines(keepends=True)
+        filled += 1
+
+if filled != 1:
+    sys.exit(f"expected exactly 1 cell tagged {TAG!r}, found {filled}")
+
+DST.write_text(json.dumps(nb, indent=1))
+print(f"filled 1 blanked cell -> {DST}")
+FILL6EOF
+
+# ---- challenge 7 blanked-cell filler (learner writes the approval loop) ----
+cat > "${OPS_DIR}/fill_challenge7_blank.py" <<'FILL7EOF'
+"""Write /tmp/07_the_complete_agent.solved.ipynb with the blanked cell
+completed: the HITL approval while-loop. Idempotent: re-running overwrites
+the output."""
+import json
+import sys
+from pathlib import Path
+
+SRC = Path("/opt/workshop/instruqt/07_the_complete_agent.ipynb")
+DST = Path("/tmp/07_the_complete_agent.solved.ipynb")
+TAG = "instruqt-blank-approval-loop"
+
+SOLUTION = '''while result.get("__interrupt__"):
+    payload = result["__interrupt__"][0].value
+    actions = payload.get("action_requests", [])
+    for action in actions:
+        print(f"  HITL pause -> approving {action['name']}: {action['args'].get('file_path','?')}")
+    result = complete_agent.invoke(
+        Command(resume={"decisions": [{"type": "approve"} for _ in actions]}),
+        config=config,
+    )
+'''
+
+nb = json.loads(SRC.read_text())
+filled = 0
+for cell in nb["cells"]:
+    if TAG in (cell.get("metadata") or {}).get("tags", []):
+        cell["source"] = SOLUTION.splitlines(keepends=True)
+        filled += 1
+
+if filled != 1:
+    sys.exit(f"expected exactly 1 cell tagged {TAG!r}, found {filled}")
+
+DST.write_text(json.dumps(nb, indent=1))
+print(f"filled 1 blanked cell -> {DST}")
+FILL7EOF
+
+# ---- challenge 7 check helper: did everything really run together? ----
+cat > "${OPS_DIR}/check_complete_agent.py" <<'CHK7EOF'
+"""Challenge 7 -- assert the /memories/ save persisted to the SQLite store.
+
+The report write is checked from the trace (check_trace.py). This covers the
+SEPARATE /memories/research_notes.md write, which must survive the thread.
+
+  0 ok
+  8 the memory database has no research_notes.md entry
+ 10 could not read the memory database
+
+The store key is exact ("/research_notes.md": CompositeBackend strips the
+/memories/ prefix before delegating, same as challenge 4's check).
+"""
+import sqlite3
+import sys
+
+from langgraph.store.sqlite import SqliteStore
+
+MEMORY_DB = "/opt/workshop/instruqt/deep_agents_memory.db"
+NAMESPACE = ("memories", "shared")
+MEMORY_KEY = "/research_notes.md"
+
+try:
+    conn = sqlite3.connect(MEMORY_DB, check_same_thread=False, isolation_level=None)
+    store = SqliteStore(conn)
+    store.setup()
+    item = store.get(NAMESPACE, MEMORY_KEY)
+except Exception as e:
+    print("check_complete_agent: %s" % type(e).__name__, file=sys.stderr)
+    sys.exit(10)
+
+if item is None:
+    sys.exit(8)
+
+print("Confirmed %r in the memory store." % MEMORY_KEY)
+sys.exit(0)
+CHK7EOF
+
+# ---- challenge 5 check helper: did middleware + HITL approval really run? ----
+cat > "${OPS_DIR}/check_trace.py" <<'CHKTRACEEOF'
+"""Assert, from LangSmith, that the learner's agent wrote a file.
+
+The Checks run outside the notebook kernel, so they can't see the agent's
+virtual filesystem. The trace can: every write_file tool run records its
+file_path and content. So instead of copying files to disk for the Check,
+read what the agent did straight from the learner's own project.
+
+Without a LangSmith key, utils/models.py writes the same run trees to
+/var/lib/lab-traces/ (one file per invoke), and the same assertions run there.
+
+  check_trace.py --path /haiku.txt
+                 [--after-resume]          write must be in a resumed (HITL) run
+                 [--prompt-contains TEXT]  repeatable; text the model must see
+
+  0 ok
+  2 nothing traced yet (traces lag a few seconds)
+  6 no successful write_file to --path
+  7 the write ran without a HITL pause (interrupt_on not active)
+  8 a --prompt-contains marker never reached the model
+ 10 could not reach LangSmith
+"""
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv("/opt/workshop/.env", override=True)
+
+TRACE_DIR = Path("/var/lib/lab-traces")
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--path", required=True)
+ap.add_argument("--after-resume", action="store_true")
+ap.add_argument("--prompt-contains", action="append", default=[])
+args = ap.parse_args()
+
+
+def written_path(inputs):
+    inputs = inputs or {}
+    return inputs.get("file_path") or inputs.get("path")
+
+
+def check_local():
+    """Same assertions as below, against the local trace files."""
+    traces = []
+    for f in TRACE_DIR.glob("*.json"):
+        try:
+            traces.append(json.loads(f.read_text()))
+        except (OSError, ValueError):
+            continue
+    # (write run, the whole trace it belongs to); the root run is listed first.
+    mine = [(r, runs) for runs in traces for r in runs
+            if r["run_type"] == "tool" and r["name"] == "write_file"
+            and written_path(r["inputs"]) == args.path and not r["error"]
+            and (r["inputs"] or {}).get("content")]
+    if not mine:
+        sys.exit(6)
+    mine.sort(key=lambda m: m[0]["start_time"], reverse=True)
+    if args.after_resume:
+        mine = [m for m in mine if "resume" in str(m[1][0]["inputs"])]
+        if not mine:
+            sys.exit(7)
+    if args.prompt_contains:
+        llm_inputs = " ".join(str(r["inputs"]) for r in mine[0][1] if r["run_type"] == "llm")
+        if not all(marker in llm_inputs for marker in args.prompt_contains):
+            sys.exit(8)
+    print("Confirmed in the local trace log: write_file %s." % args.path)
+    sys.exit(0)
+
+
+if not os.environ.get("LANGSMITH_API_KEY"):
+    check_local()
+
+from langsmith import Client
+
+project = os.environ["LANGSMITH_PROJECT"]
+since = datetime.now(timezone.utc) - timedelta(hours=6)
+
+try:
+    client = Client()
+    writes = list(client.list_runs(
+        project_name=project, run_type="tool", start_time=since,
+        filter='eq(name, "write_file")',
+        select=["id", "name", "trace_id", "inputs", "error", "start_time"],
+        limit=100,
+    ))
+except Exception as e:
+    # Never print the error body: a credential failure can echo the key back.
+    print("check_trace: %s" % type(e).__name__, file=sys.stderr)
+    sys.exit(10)
+
+if not writes:
+    try:
+        anything = next(iter(client.list_runs(project_name=project, start_time=since, limit=1)), None)
+    except Exception:
+        anything = None
+    sys.exit(6 if anything else 2)
+
+mine = [w for w in writes
+        if written_path(w.inputs) == args.path and not w.error and (w.inputs or {}).get("content")]
+if not mine:
+    sys.exit(6)
+
+# Newest first: a learner who fixed their code and re-ran should be judged on
+# the latest run, not an earlier broken one.
+mine.sort(key=lambda r: r.start_time, reverse=True)
+
+try:
+    if args.after_resume:
+        # A HITL-approved write runs inside the RESUMED invoke, whose root input
+        # is Command(resume=...). Without interrupt_on, the write lands in the
+        # first invoke instead, whose root input is the user's message.
+        resumed = [w for w in mine if "resume" in str(client.read_run(w.trace_id).inputs)]
+        if not resumed:
+            sys.exit(7)
+        mine = resumed
+
+    if args.prompt_contains:
+        target = mine[0]
+        llm_inputs = " ".join(
+            str(r.inputs) for r in client.list_runs(
+                project_name=project, trace_id=target.trace_id, run_type="llm",
+                select=["id", "inputs"],
+            )
+        )
+        if not all(marker in llm_inputs for marker in args.prompt_contains):
+            sys.exit(8)
+except SystemExit:
+    raise
+except Exception as e:
+    print("check_trace: %s" % type(e).__name__, file=sys.stderr)
+    sys.exit(10)
+
+print("Confirmed in LangSmith: write_file %s (trace %s)." % (args.path, mine[0].trace_id))
+sys.exit(0)
+CHKTRACEEOF
+
+# ---- challenge 4 check helper: did a memory really persist to disk? ----
+# Exit codes are this script's failure vocabulary; check-workstation turns each
+# into a specific learner-facing message.
+cat > "${OPS_DIR}/check_backends_memory.py" <<'CHK4EOF'
+"""Challenge 4 -- assert a memory really persisted to the SQLite-backed store.
+
+  0 ok
+  2 the memory database doesn't exist yet
+  6 the database exists, but no saved memory mentions the expected fact
+ 10 could not open/read the database
+
+Unlike the LangSmith-trace checks in earlier challenges, this one reads the
+actual persistence layer directly -- StoreBackend writes through LangGraph's
+BaseStore interface to store.put(("memories", "shared"), file_path, {"content":
+...}), confirmed against deepagents' own source (backends/store.py,
+backends/composite.py) rather than assumed. Opening the same SQLite file the
+notebook wrote and searching that one namespace is a stronger proof than
+trusting the model's own claim that it saved something.
+"""
+import os
+import sys
+
+from dotenv import load_dotenv
+
+load_dotenv("/opt/workshop/.env", override=True)
+
+MEMORY_DB = "/opt/workshop/instruqt/deep_agents_memory.db"
+NAMESPACE = ("memories", "shared")
+EXPECTED = "python"
+
+if not os.path.isfile(MEMORY_DB) or os.path.getsize(MEMORY_DB) == 0:
+    sys.exit(2)
+
+try:
+    import sqlite3
+
+    from langgraph.store.sqlite import SqliteStore
+
+    conn = sqlite3.connect(MEMORY_DB, check_same_thread=False, isolation_level=None)
+    store = SqliteStore(conn)
+    store.setup()  # idempotent -- CREATE TABLE IF NOT EXISTS
+    items = store.search(NAMESPACE, limit=50)
+except Exception as e:
+    print("check_backends_memory: %s" % type(e).__name__, file=sys.stderr)
+    sys.exit(10)
+
+matches = [
+    it for it in items
+    if EXPECTED in str((it.value or {}).get("content", "")).lower()
+]
+if not matches:
+    sys.exit(6)
+
+print("Memory confirmed on disk: %d item(s) in namespace %r, %d mentioning %r."
+      % (len(items), NAMESPACE, len(matches), EXPECTED))
+sys.exit(0)
+CHK4EOF
+
+# ---- challenge 3 check helper: did the agent run? ----
+# Exit codes are this script's failure vocabulary; check-workstation turns each
+# into a specific learner-facing message.
+cat > "${OPS_DIR}/check_custom_tools_subagents.py" <<'CHK3EOF'
+"""Challenge 3 -- assert the 'custom-tools-and-subagents' run reached the traces.
+
+  0 ok
+  2 nothing traced yet
+  3 traces exist, but none named 'custom-tools-and-subagents'
+ 10 could not reach LangSmith
+
+Without a LangSmith key, the run comes from the local files utils/models.py
+writes (/var/lib/lab-traces/, one per invoke) instead; 2 and 10 can't happen.
+
+Deliberately does NOT require a web_search call in the trace: whether the
+model searches is its own choice, so the Check asserts only that the
+learner's agent ran.
+"""
+import inspect
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv("/opt/workshop/.env", override=True)
+
+try:
+    from langsmith.utils import LangSmithNotFoundError
+except ImportError:  # older SDKs
+    LangSmithNotFoundError = ()
+
+RUN_NAME = "custom-tools-and-subagents"
+SELECT = ["id", "name", "trace_id", "run_type", "start_time", "parent_run_id"]
+TRACE_DIR = Path("/var/lib/lab-traces")
+
+
+def check_local():
+    for f in TRACE_DIR.glob("*.json"):
+        try:
+            runs = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if runs and runs[0]["name"] == RUN_NAME:
+            print("Run '%s' confirmed in the local trace log." % RUN_NAME)
+            sys.exit(0)
+    sys.exit(3)
+
+
+if not os.environ.get("LANGSMITH_API_KEY"):
+    check_local()
+
+from langsmith import Client
+
+project = os.environ["LANGSMITH_PROJECT"]
+since = datetime.now(timezone.utc) - timedelta(hours=6)
+
+
+def supports(param):
+    try:
+        return param in inspect.signature(client.list_runs).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+try:
+    client = Client()
+    if supports("is_root"):
+        roots = list(client.list_runs(project_name=project, select=SELECT,
+                                      start_time=since, is_root=True, limit=50))
+    else:
+        roots = [r for r in client.list_runs(project_name=project, select=SELECT,
+                                             start_time=since, limit=100)
+                 if r.parent_run_id is None]
+except LangSmithNotFoundError:
+    sys.exit(2)
+except Exception as e:
+    print("check_custom_tools_subagents: %s" % type(e).__name__, file=sys.stderr)
+    sys.exit(10)
+
+if not roots:
+    sys.exit(2)
+if not any(r.name == RUN_NAME for r in roots):
+    sys.exit(3)
+
+print("Run '%s' confirmed in LangSmith." % RUN_NAME)
+sys.exit(0)
+CHK3EOF
+
+# ---- challenge 9 check helper: does the deployable graph really build? ----
+# Run as the workshop user (see the challenge 9 check), so importing the agent
+# never leaves root-owned files in the learner's tree.
+cat > "${OPS_DIR}/check_deploy.py" <<'CHK8EOF'
+"""Challenge 9 -- langgraph.json validates AND every graph it registers builds.
+
+`langgraph validate` only schema-checks langgraph.json; it never imports a
+graph, so a wrong module path passes it. This also does what the server does at
+startup: import each registered graph, and call it if it's a factory.
+
+  0 ok
+  6 langgraph validate failed
+  7 a registered graph failed to import or build
+"""
+import importlib.util
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path("/opt/workshop")
+sys.path.insert(0, str(ROOT))
+
+validate = subprocess.run(
+    [str(ROOT / ".venv" / "bin" / "langgraph"), "validate"],
+    cwd=ROOT, capture_output=True, text=True,
+)
+if validate.returncode != 0:
+    print("check_deploy: langgraph validate exited %d" % validate.returncode, file=sys.stderr)
+    sys.exit(6)
+
+graphs = json.loads((ROOT / "langgraph.json").read_text())["graphs"]
+for name, ref in graphs.items():
+    path, _, attr = ref.partition(":")
+    try:
+        spec = importlib.util.spec_from_file_location("graph_" + name, ROOT / path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        obj = getattr(module, attr)
+        graph = obj if hasattr(obj, "get_graph") else obj()
+        graph.get_graph()
+    except Exception as e:
+        print("check_deploy: %s: %s" % (name, type(e).__name__), file=sys.stderr)
+        sys.exit(7)
+
+print("langgraph.json validated; built %s." % ", ".join(graphs))
+sys.exit(0)
+CHK8EOF
+
+# ---- challenges 10-14 check helper: read the learner's LangSmith workspace ----
+cat > "${OPS_DIR}/check_langsmith.py" <<'CHKLSEOF'
+"""Challenges 10-14 -- assert, in the learner's workspace, what each notebook creates.
+
+  check_langsmith.py prompt       challenge 10: prompt has 2+ commits, latest is v2
+  check_langsmith.py warmup       challenge 11: three tracing-warmup traces
+  check_langsmith.py experiment   challenge 12: dataset + scored trajectory experiment
+  check_langsmith.py rules        challenge 14: both run rules, online one root-only
+
+  0 ok
+  3 no LangSmith key stored
+  4 the prompt is missing, or has only one commit
+  5 the latest commit isn't prompt_v2
+  6 fewer than three tracing-warmup traces
+  7 the dataset is missing
+  8 no trajectory experiment on the dataset
+  9 trajectory experiment(s) ran but carry no exact_match scores -- the
+    evaluators=[...] line (the blanked cell) was left commented out
+ 11 the online eval rule is missing
+ 12 the online eval rule has no root-only filter (the blanked line)
+ 13 the routing rule is missing
+ 10 could not reach LangSmith
+
+Names carry WORKSHOP_SFX, exactly as the notebooks build them, so one
+attendee's objects never satisfy another's Check in a shared workspace.
+Online-eval SCORES are deliberately not checked: the judge runs inside
+LangSmith on the learner's own OPENAI_API_KEY workspace secret.
+"""
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+
+from dotenv import load_dotenv
+
+load_dotenv("/opt/workshop/.env", override=True)
+
+if not os.environ.get("LANGSMITH_API_KEY"):
+    sys.exit(3)
+
+import requests
+from langsmith import Client
+
+SFX = os.environ["WORKSHOP_SFX"]
+PROJECT = os.environ["LANGSMITH_PROJECT"]
+MODE = sys.argv[1]
+
+
+def check_prompt(client):
+    name = "client-research-assistant-" + SFX
+    prompt = client.get_prompt(name)
+    if prompt is None or (prompt.num_commits or 0) < 2:
+        sys.exit(4)
+    latest = client.pull_prompt(name).format_messages()[0].content
+    if "compliance flag" not in latest:
+        sys.exit(5)
+    return "prompt %s has %d commits; the latest is prompt_v2" % (name, prompt.num_commits)
+
+
+def check_warmup(client):
+    since = datetime.now(timezone.utc) - timedelta(hours=6)
+    runs = list(client.list_runs(
+        project_name=PROJECT, start_time=since, is_root=True,
+        filter='eq(name, "tracing-warmup")', select=["id"], limit=10,
+    ))
+    if len(runs) < 3:
+        sys.exit(6)
+    return "%d tracing-warmup traces in %s" % (len(runs), PROJECT)
+
+
+def check_experiment(client):
+    name = "modular-workshops-evals-" + SFX
+    if not client.has_dataset(dataset_name=name):
+        sys.exit(7)
+    dataset = client.read_dataset(dataset_name=name)
+    experiments = [p for p in client.list_projects(reference_dataset_id=dataset.id)
+                   if p.name.startswith("trajectory")]
+    if not experiments:
+        sys.exit(8)
+    # Newest first, and only a few: a learner who fixed the cell and re-ran
+    # passes on the latest experiment.
+    experiments.sort(key=lambda p: p.start_time, reverse=True)
+    for exp in experiments[:5]:
+        run_ids = [r.id for r in client.list_runs(
+            project_name=exp.name, is_root=True, select=["id"], limit=10)]
+        if run_ids and next(iter(client.list_feedback(
+                run_ids=run_ids, feedback_key=["exact_match"], limit=1)), None):
+            return "experiment %s on %s has exact_match scores" % (exp.name, name)
+    sys.exit(9)
+
+
+def check_rules(client):
+    project = client.read_project(project_name=PROJECT)
+    resp = requests.get(
+        client.api_url + "/runs/rules",
+        params={"session_id": str(project.id)},
+        headers={"x-api-key": client.api_key, "accept": "application/json"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    rules = {r.get("display_name"): r for r in resp.json()}
+    online = rules.get("workshop-online-correctness")
+    if online is None:
+        sys.exit(11)
+    if "is_root" not in (online.get("filter") or ""):
+        sys.exit(12)
+    if "workshop-route-correctness" not in rules:
+        sys.exit(13)
+    return "both run rules on %s; the online rule scores root traces only" % PROJECT
+
+
+CHECKS = {"prompt": check_prompt, "warmup": check_warmup,
+          "experiment": check_experiment, "rules": check_rules}
+
+try:
+    message = CHECKS[MODE](Client())
+except SystemExit:
+    raise
+except Exception as e:
+    # Never print the error body: a credential failure can echo the key back.
+    print("check_langsmith: %s" % type(e).__name__, file=sys.stderr)
+    sys.exit(10)
+
+print("Confirmed in LangSmith: " + message + ".")
+sys.exit(0)
+CHKLSEOF
+
+# ---- blanked-cell filler for challenges 9-14 (uncomment named lines) ----
+# Challenges 2-7 each have their own filler. The newer blanks are all "uncomment
+# these exact lines", so one filler takes the lines as arguments.
+cat > "${OPS_DIR}/fill_blank.py" <<'FILLEOF'
+"""Copy a notebook to DST with the named lines of its TAG-ged cell uncommented.
+
+  fill_blank.py SRC DST TAG LINE [LINE ...]
+
+Each LINE is the code as it should read once uncommented (leading whitespace
+ignored). The learner's own notebook is never modified. Exits 1 if the tag or
+any line isn't found, so a drifted notebook fails the solve loudly.
+"""
+import json
+import sys
+
+src, dst, tag, *wanted = sys.argv[1:]
+nb = json.load(open(src))
+cells = [c for c in nb["cells"] if tag in c.get("metadata", {}).get("tags", [])]
+if len(cells) != 1:
+    sys.exit("fill_blank: expected one cell tagged %s, found %d" % (tag, len(cells)))
+
+lines = "".join(cells[0]["source"]).split("\n")
+for want in wanted:
+    hits = [i for i, l in enumerate(lines) if l.strip() == "# " + want.strip()]
+    if not hits:
+        sys.exit("fill_blank: no commented line %r in %s" % (want, tag))
+    for i in hits:
+        lines[i] = lines[i].replace("# ", "", 1)
+cells[0]["source"] = "\n".join(lines).splitlines(keepends=True)
+
+json.dump(nb, open(dst, "w"), indent=1)
+print("fill_blank: wrote %s" % dst)
+FILLEOF
+
+# ---- challenge 12 solve helper: reproduce exactly what the Check reads ----
+cat > "${OPS_DIR}/solve_offline_evals.py" <<'SOLVE12EOF'
+"""Reproduce challenge 12's graded state: the dataset and ONE scored
+trajectory experiment.
+
+Targeted, unlike the other solves, which execute the whole notebook: this
+notebook runs two full experiments over four research tasks, which doesn't fit
+a lifecycle script's time budget. Same names and code as the notebook, with the
+blanked evaluators=[...] line filled.
+
+Without a LangSmith key there is nothing to create; exits 0 with a warning so a
+learner who pressed Skip isn't left stuck.
+"""
+import os
+import sys
+from collections import Counter
+
+sys.path.insert(0, "/opt/workshop")
+from dotenv import load_dotenv
+
+load_dotenv("/opt/workshop/.env", override=True)
+
+if not os.environ.get("LANGSMITH_API_KEY"):
+    print("SOLVE WARNING: no LangSmith key stored; challenge 12 needs one. Nothing created.",
+          file=sys.stderr)
+    sys.exit(0)
+
+from langsmith import Client, uuid7
+
+from agents.research_agent import build_research_agent
+
+client = Client()
+
+examples = [
+    ("Write a haiku about Python to /haiku.txt", ["write_file"]),
+    ("Research the latest AI agent frameworks and write a brief report to /report.md", ["task", "write_file"]),
+    ("Write a short memo to /memo.md, then read it back to confirm", ["write_file", "read_file"]),
+    ("Plan out a small research project on LangSmith, then research it and write a report to /report.md",
+     ["write_todos", "task", "write_file"]),
+]
+dataset_name = "modular-workshops-evals-" + os.environ["WORKSHOP_SFX"]
+if client.has_dataset(dataset_name=dataset_name):
+    client.delete_dataset(dataset_id=client.read_dataset(dataset_name=dataset_name).id)
+dataset = client.create_dataset(dataset_name)
+client.create_examples(
+    inputs=[{"query": q} for q, _ in examples],
+    outputs=[{"trajectory": t} for _, t in examples],
+    dataset_id=dataset.id,
+)
+print("solve: dataset created")
+
+agent = build_research_agent()
+
+
+def run_agent_trajectory(inputs):
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": inputs["query"]}]},
+        config={"configurable": {"thread_id": str(uuid7())}},
+    )
+    return {"trajectory": [tc["name"] for m in result["messages"]
+                           for tc in (getattr(m, "tool_calls", None) or [])]}
+
+
+def trajectory_match(outputs, reference_outputs):
+    return {"key": "exact_match",
+            "score": int(outputs["trajectory"] == reference_outputs["trajectory"])}
+
+
+def extra_steps(outputs, reference_outputs):
+    extras = Counter(outputs["trajectory"]) - Counter(reference_outputs["trajectory"])
+    return {"key": "extra_steps", "score": sum(extras.values())}
+
+
+def missing_steps(outputs, reference_outputs):
+    missing = Counter(reference_outputs["trajectory"]) - Counter(outputs["trajectory"])
+    return {"key": "missing_steps", "score": sum(missing.values())}
+
+
+client.evaluate(
+    run_agent_trajectory,
+    data=dataset_name,
+    evaluators=[trajectory_match, extra_steps, missing_steps],
+    experiment_prefix="trajectory",
+    max_concurrency=4,
+)
+print("solve: trajectory experiment scored")
+SOLVE12EOF
+
+# No LangSmith project is created here: there is no key at setup time, and
+# LangSmith creates the project automatically when the learner's first trace
+# arrives.
+echo "✅ Step 8/10 completed"
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 9/10: JupyterLab service + nginx..."
+# One named workspace per challenge, each with the left sidebar collapsed, so
+# the file browser doesn't take a third of the screen. Each challenge's tab URL
+# opens its own (/lab/workspaces/<challenge slug>/tree/...), so one challenge's
+# open notebooks don't carry into the next. Imported with JupyterLab's own CLI
+# because the filename carries a hash of the name. The server is pointed at the
+# same directory explicitly -- setup runs as root, so the import would
+# otherwise land in /root/.jupyter.
+JL_WORKSPACES_DIR="/home/${WORKSHOP_USER}/.jupyter/lab/workspaces"
+JL_WORKSPACES="setup your-first-deep-agent custom-tools-and-subagents backends-and-memory middleware-and-hitl agents-and-skills the-complete-agent gateway-policies package-and-deploy prompts tracing offline-evals environment-evals online-evals"
+mkdir -p "$JL_WORKSPACES_DIR"
+for ws in $JL_WORKSPACES; do
+  cat > /tmp/workspace.json <<WSEOF
+{
+  "data": {
+    "layout-restorer:data": {
+      "main": {"dock": null},
+      "left": {"collapsed": true, "visible": true, "widgets": ["filebrowser"]},
+      "right": {"collapsed": true, "visible": true, "widgets": []}
+    }
+  },
+  "metadata": {"id": "${ws}"}
+}
+WSEOF
+  "${WORKSHOP_DIR}/.venv/bin/jupyter" lab workspaces import \
+    --LabWorkspaceImportApp.workspaces_dir="$JL_WORKSPACES_DIR" \
+    --name "$ws" /tmp/workspace.json
+done
+rm -f /tmp/workspace.json
+chown -R "${WORKSHOP_USER}:${WORKSHOP_USER}" "/home/${WORKSHOP_USER}/.jupyter"
+
+# No "get notified about Jupyter news?" toast on every load. App-level
+# settings overrides apply to every workspace.
+mkdir -p "${WORKSHOP_DIR}/.venv/share/jupyter/lab/settings"
+cat > "${WORKSHOP_DIR}/.venv/share/jupyter/lab/settings/overrides.json" <<'OVREOF'
+{
+  "@jupyterlab/apputils-extension:notification": {
+    "fetchNews": "false",
+    "checkForUpdates": false
+  }
+}
+OVREOF
+
+cat > /etc/systemd/system/jupyterlab.service <<JLUNITEOF
+[Unit]
+Description=JupyterLab (workshop notebooks)
+After=network-online.target
+
+[Service]
+User=${WORKSHOP_USER}
+Group=${WORKSHOP_USER}
+EnvironmentFile=${ENV_FILE}
+ExecStart=${WORKSHOP_DIR}/.venv/bin/jupyter lab --ip 127.0.0.1 --port 8890 \
+  --no-browser --notebook-dir=${WORKSHOP_DIR} \
+  --IdentityProvider.token=\${JUPYTER_TOKEN} \
+  --LabApp.workspaces_dir=${JL_WORKSPACES_DIR} \
+  --ServerApp.allow_remote_access=True --ServerApp.allow_origin='*'
+WorkingDirectory=${WORKSHOP_DIR}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+JLUNITEOF
+
+# The workshop tree runs as the non-root service user.
+chown -R "${WORKSHOP_USER}:${WORKSHOP_USER}" "$WORKSHOP_DIR"
+
+# nginx fronts the notebook tab port on the sandbox network and proxies to the
+# loopback-bound service, injecting the Jupyter token for tab traffic. Jupyter
+# is not reachable on a VM interface directly, and the track requests no
+# external ingress at all (config.yml).
+rm -f /etc/nginx/sites-enabled/default
+cat > /etc/nginx/conf.d/instruqt-tabs.conf <<NGINXEOF
+map \$http_upgrade \$connection_upgrade {
+  default upgrade;
+  ''      close;
+}
+server {
+  listen 8888;
+  location / {
+    proxy_pass http://127.0.0.1:8890;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection \$connection_upgrade;
+    proxy_set_header Authorization "token ${JUPYTER_TOKEN}";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+  }
+}
+NGINXEOF
+chmod 600 /etc/nginx/conf.d/instruqt-tabs.conf
+nginx -t
+systemctl enable --now nginx
+systemctl restart nginx
+
+# Defense in depth: even if a firewall rule ever reopens high ports publicly,
+# the tab port only answers private/sandbox-network sources.
+iptables -A INPUT -p tcp --dport 8888 -s 127.0.0.0/8    -j ACCEPT
+iptables -A INPUT -p tcp --dport 8888 -s 10.0.0.0/8     -j ACCEPT
+iptables -A INPUT -p tcp --dport 8888 -s 172.16.0.0/12  -j ACCEPT
+iptables -A INPUT -p tcp --dport 8888 -s 192.168.0.0/16 -j ACCEPT
+iptables -A INPUT -p tcp --dport 8888 -j DROP
+
+systemctl daemon-reload
+systemctl enable --now jupyterlab.service
+
+tries=0
+until curl -s -o /dev/null -w "%{http_code}" "http://localhost:8888" | grep -qE "^(200|302|401)$"; do
+  tries=$((tries+1)); [ "$tries" -ge 40 ] && { echo "SETUP FAILED: JupyterLab not ready on port 8888 after 120s" >&2; exit 1; }
+  sleep 3
+done
+echo "✅ Step 9/10 completed"
+
+# ---------------------------------------------------------------- #
+echo "⏳ Step 10/10: Bedrock warm-up + verification..."
+# First use of an Anthropic model in a fresh sandbox can take minutes while AWS
+# finishes enabling access in the background — warm it with retries. Guarded: a
+# warm-up failure logs loudly but doesn't kill setup (runtime-verify item in
+# MEMORY.md).
+cat > "${OPS_DIR}/warmup_bedrock.py" <<'WARMEOF'
+import os, sys, time
+from dotenv import load_dotenv
+load_dotenv("/root/workshop/.env", override=True)
+# Warm-up calls must NOT trace — they'd land as root runs in the learner's
+# project before the learner has run anything.
+os.environ["LANGSMITH_TRACING"] = "false"
+sys.path.insert(0, "/root/workshop")
+from utils.models import model
+
+ok = False
+for attempt in range(12):
+    try:
+        model.invoke("Reply with the single word: ready")
+        print(f"warmup sonnet: ok (attempt {attempt + 1})")
+        ok = True
+        break
+    except Exception as exc:
+        print(f"warmup sonnet: attempt {attempt + 1} failed: {str(exc)[:140]}")
+        time.sleep(15)
+if not ok:
+    print(f"WARMUP INCOMPLETE — model id: {model.model_id}")
+    sys.exit(1)
+WARMEOF
+if ! "$VENV_PY" "${OPS_DIR}/warmup_bedrock.py"; then
+  echo "⚠️  Bedrock warm-up incomplete. Manual fallback values:"
+  echo "    region: ${BEDROCK_REGION}"
+  echo "    sonnet: ${BEDROCK_MODEL_SONNET}"
+  echo "    First learner cell may need one retry while AWS finishes enablement."
+fi
+
+# ---- setup verification tail: install ≠ functional ----
+verify() {
+  local label="$1"; shift
+  if "$@" > /dev/null 2>&1; then
+    echo "  ✓ ${label}"
+  else
+    echo "SETUP VERIFICATION FAILED: ${label}" >&2
+    exit 1
+  fi
+}
+verify "python deps importable" "$VENV_PY" -c "import deepagents, langchain_aws, langsmith, tavily, dotenv"
+verify "setup notebook generated" test -s "${INSTRUQT_DIR}/01_setup.ipynb"
+verify "your-first-deep-agent notebook generated" test -s "${INSTRUQT_DIR}/02_your_first_deep_agent.ipynb"
+verify "deep agent diagram present" test -s "${WORKSHOP_DIR}/images/deepAgentsDiag.png"
+verify "credential seeder present" test -s "${OPS_DIR}/seed_credentials.py"
+verify "sentinel helper present" test -s "${INSTRUQT_DIR}/lab_state.py"
+verify "challenge 2 blank-filler compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/fill_challenge2_blank.py"
+verify "deep agent subagents diagram present" test -s "${WORKSHOP_DIR}/images/deepAgentSubagents.png"
+verify "custom-tools-and-subagents notebook generated" test -s "${INSTRUQT_DIR}/03_custom_tools_and_subagents.ipynb"
+verify "challenge 3 blank-filler compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/fill_challenge3_blank.py"
+verify "challenge 3 check helper compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/check_custom_tools_subagents.py"
+verify "backends-and-memory notebook generated" test -s "${INSTRUQT_DIR}/04_backends_and_memory.ipynb"
+verify "challenge 4 blank-filler compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/fill_challenge4_blank.py"
+verify "challenge 4 check helper compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/check_backends_memory.py"
+verify "middleware diagram present" test -s "${WORKSHOP_DIR}/images/deepAgentMiddleware.png"
+verify "offloading-inputs diagram present" test -s "${WORKSHOP_DIR}/images/Offloading Inputs LangChain.png"
+verify "offloading-results diagram present" test -s "${WORKSHOP_DIR}/images/Offloading Results LangChain.png"
+verify "summarization diagram present" test -s "${WORKSHOP_DIR}/images/LangChain Summarization.png"
+verify "HITL diagram present" test -s "${WORKSHOP_DIR}/images/deepAgentHITL.png"
+verify "middleware-and-hitl notebook generated" test -s "${INSTRUQT_DIR}/05_middleware_and_hitl.ipynb"
+verify "challenge 5 blank-filler compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/fill_challenge5_blank.py"
+verify "trace check helper compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/check_trace.py"
+verify "agents-and-skills notebook generated" test -s "${INSTRUQT_DIR}/06_agents_and_skills.ipynb"
+verify "challenge 6 blank-filler compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/fill_challenge6_blank.py"
+verify "the-complete-agent notebook generated" test -s "${INSTRUQT_DIR}/07_the_complete_agent.ipynb"
+verify "challenge 7 blank-filler compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/fill_challenge7_blank.py"
+verify "challenge 7 check helper compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/check_complete_agent.py"
+for nb in 08_gateway_policies 09_package_and_deploy 10_prompts 11_tracing 12_offline_evals 13_environment_evals 14_online_evals; do
+  verify "${nb} notebook generated" test -s "${INSTRUQT_DIR}/${nb}.ipynb"
+done
+verify "challenge 9 check helper compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/check_deploy.py"
+verify "langgraph CLI present" test -x "${WORKSHOP_DIR}/.venv/bin/langgraph"
+verify "langsmith check helper compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/check_langsmith.py"
+verify "blank-filler compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/fill_blank.py"
+verify "challenge 12 solve helper compiles" "$VENV_PY" -m py_compile "${OPS_DIR}/solve_offline_evals.py"
+verify "harbor CLI present" test -x "${WORKSHOP_DIR}/.venv/bin/harbor"
+verify "harbor tasks present" test -s "${WORKSHOP_DIR}/environment_evals/dataset/noise-pollution-report/tests/verify.py"
+verify "harbor container can reach Bedrock" grep -q langchain-aws "${WORKSHOP_DIR}/environment_evals/deep-agent/langgraph.json"
+verify "evals diagrams present" test -s "${WORKSHOP_DIR}/images/trajectory.png"
+verify "models.py exports MODEL_SPEC" grep -q "^MODEL_SPEC" "${WORKSHOP_DIR}/utils/models.py"
+verify "parallel search helper importable" sh -c "cd ${WORKSHOP_DIR} && ${VENV_PY} -c 'import utils.parallel_search'"
+verify "shared agents use parallel search" sh -c "! grep -q resilient_tavily_search ${WORKSHOP_DIR}/agents/research_agent.py ${WORKSHOP_DIR}/agents/deep_agent/agent.py"
+verify "credential helper compiles" "$VENV_PY" -m py_compile "${INSTRUQT_DIR}/lab_credentials.py"
+verify "trace-link helper compiles" "$VENV_PY" -m py_compile "${INSTRUQT_DIR}/lab_trace.py"
+verify "models.py points at Bedrock" grep -q ChatBedrockConverse "${WORKSHOP_DIR}/utils/models.py"
+verify "local trace dir is world-writable (no-LangSmith Checks)" sh -c "test \"\$(stat -c %a /var/lib/lab-traces)\" = 1777"
+verify "jupyterlab serving" curl -sf http://localhost:8888/api
+for ws in $JL_WORKSPACES; do
+  verify "workspace ${ws} served (sidebar collapsed)" sh -c "curl -sf http://localhost:8888/lab/api/workspaces/${ws} | grep -q collapsed"
+done
+verify "jupyter news toast disabled" sh -c "curl -sf http://localhost:8888/lab/api/settings/@jupyterlab/apputils-extension:notification | jq -e '.schema.properties.fetchNews.default == \"false\"'"
+# No LangSmith probe here — there is no key until the learner enters one.
+# The getpass cell validates it live at the moment it is typed instead.
+verify "env file has no credentials pre-seeded" bash -c "! grep -q '^LANGSMITH_API_KEY=' /opt/workshop/.env"
+
+touch /opt/instruqt/bootstrap/workshop-ready
+echo "✅ Step 10/10 completed — workshop ready"

@@ -1,0 +1,68 @@
+#!/bin/bash
+#
+# Check — challenge 3 (custom-tools-and-subagents)
+#
+# No strict set flags (house default): every probe is handled explicitly so the
+# fail-message always reaches the learner instead of the script dying on an
+# unset variable.
+#
+# The pass condition is LIVE: a trace in the learner's own project, named
+# 'custom-tools-and-subagents', containing a real tavily_search tool span. A
+# notebook that merely executed is not enough — the model can answer plenty of
+# questions without searching at all, so "ran" and "used the tool" are
+# different claims, and only this check tells them apart.
+#
+# Time budget: two bounded LangSmith queries. Well inside the ~60s ceiling; a
+# killed check never shows its message.
+
+_fail() {
+  fail-message "$1" 2>/dev/null || echo "FAIL: $1" >&2
+  exit 1
+}
+
+ENV_FILE=/opt/workshop/.env
+VENV_PY=/opt/workshop/.venv/bin/python
+
+if [ ! -f "$ENV_FILE" ]; then
+  _fail "Setup hasn't finished yet. Wait a moment and click Check again."
+fi
+
+# [Check 1/2] prerequisites from challenge 1, worded gently: skipping is
+# enabled, so a learner can legitimately arrive here without having done it.
+if ! grep -q '^LANGSMITH_API_KEY=lsv2_' "$ENV_FILE"; then
+  _fail "[Check 1/2] No LangSmith key stored. Run the first cell of 01_setup.ipynb to enter one."
+fi
+if grep -q '^LANGSMITH_API_KEY=lsv2_pt_solveplaceholder' "$ENV_FILE"; then
+  _fail "[Check 1/2] Challenge 1 was skipped, so the stored key is a placeholder and can't send traces. Run the first cell of 01_setup.ipynb with your own key, then re-run this notebook."
+fi
+if ! grep -q '^TAVILY_API_KEY=tvly-' "$ENV_FILE"; then
+  _fail "[Check 1/2] No Tavily key stored. This agent searches the web — re-run the first cell of 01_setup.ipynb and enter one."
+fi
+
+# [Check 2/2] the live assertion: tavily_search really ran.
+timeout --kill-after=3 50 "$VENV_PY" /opt/instruqt-workshop/check_custom_tools_subagents.py
+rc=$?
+
+case "$rc" in
+  0)
+    exit 0
+    ;;
+  2)
+    _fail "[Check 2/2] Your notebook ran, but no traces have reached LangSmith. Traces lag a few seconds — wait and click Check again."
+    ;;
+  3)
+    _fail "[Check 2/2] There are traces in your project, but none named 'custom-tools-and-subagents'. Run the 'Run it' cell."
+    ;;
+  6)
+    _fail "[Check 2/2] Your agent answered without searching. Make sure both 'tools=[tavily_search],' and 'subagents=[research_subagent],' are uncommented in the create_deep_agent cell, then re-run that cell and every cell below it."
+    ;;
+  7)
+    _fail "[Check 2/2] tavily_search ran, but returned canned fallback content — your Tavily key isn't working. Re-run the first cell of 01_setup.ipynb with a valid key, then re-run this notebook."
+    ;;
+  124 | 137)
+    _fail "[Check 2/2] LangSmith didn't answer in time. Usually a slow moment, not your work — click Check again."
+    ;;
+  *)
+    _fail "[Check 2/2] Couldn't read your traces from LangSmith. Re-run the last cell of 01_setup.ipynb to confirm the connection, then click Check again."
+    ;;
+esac

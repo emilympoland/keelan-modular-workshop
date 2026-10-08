@@ -1,0 +1,37 @@
+#!/bin/bash
+#
+# Check — challenge 13 (environment-evals)
+#
+# No strict set flags (house default): every probe is handled explicitly so the
+# fail-message always reaches the learner instead of the script dying on an
+# unset variable.
+#
+# Graded on the local run: the agent ran in the scratch workspace and the
+# verifier scored it (the verifier cell writes its sentinel only when verify.py
+# exits 0). No LangSmith key is needed. The Harbor job is optional and ungraded:
+# it needs LangSmith Sandboxes, which many workspaces don't have.
+
+_fail() {
+  fail-message "$1" 2>/dev/null || echo "FAIL: $1" >&2
+  exit 1
+}
+
+ENV_FILE=/opt/workshop/.env
+VENV_PY=/opt/workshop/.venv/bin/python
+
+if [ ! -f "$ENV_FILE" ]; then
+  _fail "Setup hasn't finished yet. Wait a moment and click Check again."
+fi
+
+# [Check 1/2] the agent ran in the scratch workspace
+if [ ! -d /opt/workshop/.dev-workspace/info ]; then
+  _fail "[Check 1/2] Run the cell under '2. Run it locally' in 13_environment_evals.ipynb."
+fi
+
+# [Check 2/2] the verifier ran on it and exited cleanly
+if [ ! -f /tmp/.env-eval-verified ]; then
+  _fail "[Check 2/2] Run the cell under '3. The verifier'. If it ran, read its output: verify.py didn't exit cleanly."
+fi
+
+echo "Agent ran in the scratch workspace and the verifier scored it."
+exit 0

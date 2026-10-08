@@ -1,0 +1,59 @@
+#!/bin/bash
+#
+# Check — challenge 9 (package-and-deploy)
+#
+# No strict set flags (house default): every probe is handled explicitly so the
+# fail-message always reaches the learner instead of the script dying on an
+# unset variable.
+#
+# The deploy cell is optional and ungraded: it needs a service key and creates
+# a billable deployment. The graded work is validate + the blanked build cell
+# (its confirm cell writes the sentinel), re-done here independently:
+# check_deploy.py runs `langgraph validate` AND builds every registered graph,
+# because validate alone only schema-checks langgraph.json.
+#
+# check_deploy.py runs as the workshop user that owns /opt/workshop, so
+# importing the agent never leaves root-owned files in the learner's tree.
+#
+# Time budget: one validate plus one graph build, well inside the ~60s ceiling.
+
+_fail() {
+  fail-message "$1" 2>/dev/null || echo "FAIL: $1" >&2
+  exit 1
+}
+
+ENV_FILE=/opt/workshop/.env
+VENV_PY=/opt/workshop/.venv/bin/python
+
+if [ ! -f "$ENV_FILE" ]; then
+  _fail "Setup hasn't finished yet. Wait a moment and click Check again."
+fi
+
+# [Check 1/2] the confirm cell under the blanked build passed: validate
+# succeeded and the learner's graph exists
+if [ ! -f /tmp/.deploy-validate-ok ]; then
+  _fail "[Check 1/2] In 09_package_and_deploy.ipynb, uncomment the three lines under '4. Build the graph yourself', run that cell, then run the confirm cell below it."
+fi
+
+# [Check 2/2] independent re-run: validate, then build every registered graph
+cd /opt/workshop || _fail "[Check 2/2] The workshop directory is missing. Restart the track."
+timeout --kill-after=3 50 runuser -u workshop -- env PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" /opt/instruqt-workshop/check_deploy.py
+rc=$?
+
+case "$rc" in
+  0)
+    exit 0
+    ;;
+  6)
+    _fail "[Check 2/2] 'langgraph validate' fails on /root/workshop/langgraph.json. If you edited it, undo the change and re-run the cells under '3' and '4'."
+    ;;
+  7)
+    _fail "[Check 2/2] langgraph.json validates, but a graph it registers doesn't build. Check each module path and attribute in 'graphs', and that agents/deep_agent/agent.py still imports cleanly, then re-run the cells under '3' and '4'."
+    ;;
+  124 | 137)
+    _fail "[Check 2/2] Building the graph took too long. Click Check again."
+    ;;
+  *)
+    _fail "[Check 2/2] Couldn't validate the project. Re-run the cells under '3' and '4', read its output, then click Check again."
+    ;;
+esac

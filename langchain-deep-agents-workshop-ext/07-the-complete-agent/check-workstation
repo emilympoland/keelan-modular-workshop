@@ -1,0 +1,76 @@
+#!/bin/bash
+#
+# Check — challenge 7 (the-complete-agent)
+#
+# No strict set flags (house default): every probe is handled explicitly so the
+# fail-message always reaches the learner instead of the script dying on an
+# unset variable.
+#
+# Two live assertions: the approved write_file to /final_report.md in the
+# learner's traces, then the SEPARATE /memories/research_notes.md save in the
+# SQLite store (proves it persisted, not just that the tool ran).
+#
+# Time budget: a few bounded LangSmith queries, well inside the ~60s ceiling;
+# a killed check never shows its message.
+
+_fail() {
+  fail-message "$1" 2>/dev/null || echo "FAIL: $1" >&2
+  exit 1
+}
+
+ENV_FILE=/opt/workshop/.env
+VENV_PY=/opt/workshop/.venv/bin/python
+
+if [ ! -f "$ENV_FILE" ]; then
+  _fail "Setup hasn't finished yet. Wait a moment and click Check again."
+fi
+
+# [Check 1/2] prerequisites from challenge 1, worded gently: skipping is
+# enabled, so a learner can legitimately arrive here without having done it.
+if ! grep -q '^LANGSMITH_API_KEY=lsv2_' "$ENV_FILE"; then
+  _fail "[Check 1/2] No LangSmith key stored. Run the first cell of 01_setup.ipynb to enter one."
+fi
+if grep -q '^LANGSMITH_API_KEY=lsv2_pt_solveplaceholder' "$ENV_FILE"; then
+  _fail "[Check 1/2] Challenge 1 was skipped, so the stored key is a placeholder and can't send traces. Run the first cell of 01_setup.ipynb with your own key, then re-run this notebook."
+fi
+if ! grep -q '^TAVILY_API_KEY=tvly-' "$ENV_FILE"; then
+  _fail "[Check 1/2] No Tavily key stored. This agent searches the web — re-run the first cell of 01_setup.ipynb and enter one."
+fi
+
+# [Check 2/2] the live assertion, read from the learner's own traces.
+timeout --kill-after=3 50 "$VENV_PY" /opt/instruqt-workshop/check_trace.py --path /final_report.md --after-resume
+rc=$?
+
+case "$rc" in
+  0)
+    :
+    ;;
+  6)
+    _fail "[Check 2/2] No write_file call to /final_report.md in your traces. Run the 'Run it' cell, then your approval loop."
+    ;;
+  7)
+    _fail "[Check 2/2] /final_report.md was written without a pause. Re-run the create_deep_agent cell, then 'Run it' and your approval loop."
+    ;;
+  2)
+    _fail "[Check 2/2] No traces have reached LangSmith yet. Traces lag a few seconds — wait and click Check again."
+    ;;
+  124 | 137)
+    _fail "[Check 2/2] LangSmith didn't answer in time. Usually a slow moment, not your work — click Check again."
+    ;;
+  *)
+    _fail "[Check 2/2] Couldn't read your traces from LangSmith. Re-run the last cell of 01_setup.ipynb to confirm the connection, then click Check again."
+    ;;
+esac
+
+"$VENV_PY" /opt/instruqt-workshop/check_complete_agent.py
+case "$?" in
+  0)
+    exit 0
+    ;;
+  8)
+    _fail "[Check 2/2] The report was written, but nothing was saved to /memories/research_notes.md. Make sure your approval loop keeps resuming until there are no pauses left, not just the first one."
+    ;;
+  *)
+    _fail "[Check 2/2] Couldn't read the memory database. Re-run the cell that defines open_memory_store(), then the rest of the notebook."
+    ;;
+esac

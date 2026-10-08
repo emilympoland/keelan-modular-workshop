@@ -1,0 +1,30 @@
+version: "3"
+virtualmachines:
+- name: workstation
+  image: ubuntu-os-cloud/ubuntu-2404-lts-amd64
+  environment:
+    BEDROCK_MODEL_HAIKU: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    BEDROCK_MODEL_SONNET: us.anthropic.claude-sonnet-4-6
+    BEDROCK_REGION: us-east-1
+    LANGSMITH_PROJECT_BASE: instruqt-deep-agents
+    WORKSHOP_COMMIT: 06a934f270730f7af4cbf4bd1fb7320fd9fce718
+    WORKSHOP_REPO: https://github.com/langchain-ai/modular-workshops.git
+  memory: 8192
+  cpus: 2
+aws_accounts:
+- name: bedrock
+  services:
+  - bedrock
+  regions:
+  - us-east-1
+  - us-east-2
+  - us-west-1
+  - us-west-2
+  managed_policies:
+  - arn:aws:iam::aws:policy/AmazonBedrockLimitedAccess
+# No `secrets:` block by design. Learners supply their own LangSmith and Tavily
+# keys through a getpass prompt in challenge 1 (same pattern as
+# langchain-langgraph-langsmith-ext) -- AgentCore Web Search was tried and
+# rejected (see MEMORY.md, slice 0 verdict: blocked by an AWS Organizations SCP
+# deny). Only the model runs on track-provided credentials -- the per-sandbox
+# AWS account above, which Instruqt provisions and tears down itself.

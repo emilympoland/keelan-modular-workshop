@@ -1,0 +1,103 @@
+#!/bin/bash
+#
+# Solve — challenge 1 (setup)
+#
+# The learner enters credentials through a getpass prompt, which an automated
+# test cannot type into — so this script reproduces the state that prompt
+# produces, rather than driving the prompt itself. It cannot execute the setup
+# notebook headlessly either: `jupyter nbconvert --execute` would block
+# forever on getpass.
+#
+# It runs in one of two modes:
+#
+#   With SOLVE_LANGSMITH_API_KEY set (pass it to `instruqt track test` with
+#   --runtime-parameters), the real key is stored and `verify-connection` makes
+#   a real live call — the closest an automated run gets to the learner's path.
+#
+#   Without it, no key is stored and tracing stays off -- the same state as a
+#   learner who pressed Enter at the prompt. Every later Check then reads the
+#   local trace files instead of LangSmith.
+#
+# Idempotent: re-running replaces the same keys and rewrites the same sentinels.
+#
+# Adapted from the sibling track langchain-langgraph-langsmith-ext
+# (01-connect-and-orient), same getpass credential model.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+
+# Sentinels are written by BOTH root (this script, including when Instruqt runs
+# it because a learner pressed Skip) and the non-root `workshop` account that
+# runs the Jupyter kernel. /tmp is sticky, so a non-owner can neither overwrite
+# nor unlink the other's file. Mode 666 keeps both able to rewrite it.
+sentinel() { echo ok > "$1" && chmod 666 "$1"; }
+VENV_PY="${WORKSHOP_DIR}/.venv/bin/python"
+
+# --- store credentials exactly as the getpass cell does -------------------- #
+# Delegated to the shared seeder rather than duplicated here. That seeder is the
+# single place that decides which key wins, and it KEEPS a real key the learner
+# already entered instead of dropping it — which matters
+# most right here, because Instruqt runs this script as root when a learner
+# presses Skip.
+#
+# Keys reach python through the environment, never on the command line, so a
+# real key never lands in the process list or the xtrace log.
+"$VENV_PY" "${OPS_DIR}/seed_credentials.py"
+
+sentinel /tmp/.credentials-ok
+
+# --- reproduce the notebook's model call ---------------------------------- #
+# The notebook's section-3 cell records two things separately — that the kernel
+# reached the cell, and that the model answered — so the check can tell a
+# learner who never ran it apart from a sandbox whose Bedrock is not ready.
+# Reproduce both, in the same order.
+sentinel /tmp/.setup-kernel-ok
+
+# Tracing is forced off for this one call: with a real key this run would
+# pollute the learner's project with a trace they did not create.
+#
+# Retried, because Bedrock model access can still be finishing its enablement in
+# a fresh sandbox. Bounded at 3 attempts to stay well inside the lifecycle
+# script's time budget.
+bedrock_ok=no
+for attempt in 1 2 3; do
+  if LANGSMITH_TRACING=false "$VENV_PY" - <<'PYEOF'
+import os, sys
+os.environ["LANGSMITH_TRACING"] = "false"
+sys.path.insert(0, "/opt/workshop")
+from dotenv import load_dotenv
+load_dotenv("/opt/workshop/.env", override=True)
+os.environ["LANGSMITH_TRACING"] = "false"
+from utils.models import model
+
+model.invoke("Reply with the single word: ready")
+print("solve: Bedrock model call succeeded")
+PYEOF
+  then
+    bedrock_ok=yes
+    break
+  fi
+  [ "$attempt" = 3 ] || { echo "solve: Bedrock attempt ${attempt}/3 failed — retrying in 10s" >&2; sleep 10; }
+done
+
+# Deliberately NOT fatal. Instruqt runs this script when a learner presses Skip,
+# and Skip exists to unblock them: dying here under `set -e` would leave them
+# stuck on the very challenge they gave up on, with no sentinel written. Setup's
+# own warm-up loop (12 attempts) is where a genuinely dead Bedrock gets caught.
+if [ "$bedrock_ok" = no ]; then
+  echo "SOLVE WARNING: Claude on Bedrock did not answer after 3 attempts." >&2
+  echo "  Recording the step as done anyway, so a learner who pressed Skip is not" >&2
+  echo "  left stuck. In a track test, treat this run as suspect — the model, not" >&2
+  echo "  the track's wiring, is what failed." >&2
+fi
+
+sentinel /tmp/.setup-ok
+
+# --- the independent verification step (now a notebook cell, not a terminal
+# command -- same underlying script either way) --------------------------- #
+# With a key it makes a real live call; with none (no SOLVE_LANGSMITH_API_KEY)
+# it confirms tracing is off. Both write the sentinel.
+/usr/local/bin/verify-connection
+
+echo "solve: challenge 1 state reproduced"

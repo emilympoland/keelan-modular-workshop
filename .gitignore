@@ -1,0 +1,28 @@
+# --- Secrets: never commit ---
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.jks
+credentials.json
+token.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# --- Instruqt CLI local state ---
+.instruqt/
+*.remote
+
+# --- Local previews ---
+*/preview/
+
+# --- macOS ---
+.DS_Store

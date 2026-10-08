@@ -1,0 +1,51 @@
+#!/bin/bash
+#
+# Solve — challenge 4 (backends-and-memory)
+#
+# This challenge has one genuinely blank cell (uncomment backend=/store=, and
+# replace system_prompt with the one in the instructions), so the learner's
+# notebook cannot simply be executed. So the solve fills the blank first, by
+# cell TAG, writing a copy to /tmp — the learner's own notebook is never
+# modified. Executing that copy for real is still the only automated proof
+# that every other cell in the notebook runs, and that the filled cell is a
+# correct solution.
+#
+# Full-chain defensive: skipping is enabled, so this may run without earlier
+# challenges having been played. It seeds credentials first — a real
+# SOLVE_TAVILY_API_KEY matters here too (the agent still has direct search).
+#
+# Idempotent: re-running refills the blank and re-executes, overwriting the
+# same real memory database.
+#
+# Adapted from the sibling track langchain-langgraph-langsmith-ext
+# (04-the-five-line-version), same fill-by-tag-then-execute-from-/tmp pattern.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+VENV_BIN="${WORKSHOP_DIR}/.venv/bin"
+
+# --- credentials, exactly as challenge 1's getpass cell would leave them ----- #
+"${VENV_BIN}/python" "${OPS_DIR}/seed_credentials.py"
+
+# --- fill the blanked cell -------------------------------------------------- #
+"${VENV_BIN}/python" "${OPS_DIR}/fill_challenge4_blank.py"
+
+# --- run the filled notebook ------------------------------------------------ #
+# Executed from /tmp, which is why this notebook's Setup cell (and MEMORY_DB)
+# use absolute paths rather than upstream's cwd-relative ones: nbconvert runs
+# the kernel in the input notebook's own directory, and the SQLite file has to
+# land where check-workstation actually looks for it.
+#
+# Two agent runs (thread 1 + thread 2), each potentially delegating to the
+# research subagent, so the timeout budget matches challenge 3's.
+cd /tmp
+timeout --kill-after=10 600 "${VENV_BIN}/jupyter" nbconvert \
+  --to notebook \
+  --execute \
+  --ExecutePreprocessor.timeout=360 \
+  --output-dir /tmp \
+  --output 04_backends_and_memory.executed.ipynb \
+  /tmp/04_backends_and_memory.solved.ipynb
+
+echo "solve: challenge 4 blank filled and notebook executed end to end"

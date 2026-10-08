@@ -1,0 +1,39 @@
+#!/bin/bash
+#
+# Solve — challenge 9 (package-and-deploy)
+#
+# Reproduces the graded state: validate passed and the blanked build ran.
+# It runs the same check_deploy.py the Check uses -- `langgraph validate` plus a
+# real build of every graph in langgraph.json -- and writes the cell's sentinel
+# only if that succeeds.
+#
+# The deploy is optional and ungraded, so it is not reproduced: it creates a
+# deployment in the learner's own LangSmith workspace.
+#
+# Full-chain defensive: skipping is enabled, so this may run without earlier
+# challenges having been played. It seeds credentials first.
+#
+# Idempotent: re-running re-validates and rewrites the same sentinel.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+VENV_PY="${WORKSHOP_DIR}/.venv/bin/python"
+
+# Same sentinel convention as challenge 1's solve: root and the kernel's
+# workshop user may both write it, and /tmp is sticky.
+sentinel() { echo ok > "$1" && chmod 666 "$1"; }
+
+# --- credentials, exactly as challenge 1's getpass cell would leave them ----- #
+"$VENV_PY" "${OPS_DIR}/seed_credentials.py"
+sentinel /tmp/.credentials-ok
+
+# --- the graded cell: validate, then build -------------------------------- #
+# As the workshop user, so importing the agent leaves no root-owned files.
+cd "$WORKSHOP_DIR"
+timeout --kill-after=5 120 runuser -u workshop -- env PYTHONDONTWRITEBYTECODE=1 \
+  "$VENV_PY" "${OPS_DIR}/check_deploy.py"
+
+sentinel /tmp/.deploy-validate-ok
+
+echo "solve: challenge 8 project validated and graph built"

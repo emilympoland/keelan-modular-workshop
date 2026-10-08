@@ -1,0 +1,69 @@
+#!/bin/bash
+#
+# Solve — challenge 14 (online-evals)
+#
+# Fills the blanked root-only filter, then executes the notebook for real: both
+# run rules, the queue, the 100-second activation wait, and three traces. The
+# Clean up cells at the end delete the rules the Check reads, so the copy that
+# runs stops before them.
+#
+# Idempotent: the rules are replaced by name and the queue is reused.
+#
+# Full-chain defensive: skipping is enabled, so this may run without earlier
+# challenges having been played. It seeds credentials first.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+VENV_BIN="${WORKSHOP_DIR}/.venv/bin"
+
+# --- credentials, exactly as challenge 1's getpass cell would leave them ----- #
+"${VENV_BIN}/python" "${OPS_DIR}/seed_credentials.py"
+
+# Needs a LangSmith key (the notebook's Setup cell refuses to run without one).
+# Without it, warn and exit 0 so a learner who pressed Skip isn't left stuck.
+if ! grep -q '^LANGSMITH_API_KEY=lsv2_' "${WORKSHOP_DIR}/.env"; then
+  echo "SOLVE WARNING: no LangSmith key stored; this challenge needs one. Nothing run." >&2
+  exit 0
+fi
+
+# create_run_rule reads the tracing project. A learner's first trace creates it,
+# but a test run's challenge 1 solve deliberately traces nothing.
+"${VENV_BIN}/python" - <<'PROJEOF'
+import os
+from dotenv import load_dotenv
+load_dotenv("/opt/workshop/.env", override=True)
+from langsmith import Client
+c = Client()
+if not c.has_project(os.environ["LANGSMITH_PROJECT"]):
+    c.create_project(os.environ["LANGSMITH_PROJECT"])
+PROJEOF
+
+# --- fill the blanked cell (into a /tmp copy; the learner's is untouched) --- #
+"${VENV_BIN}/python" "${OPS_DIR}/fill_blank.py" \
+  /opt/workshop/instruqt/14_online_evals.ipynb /tmp/14_online_evals.solved.ipynb instruqt-blank-root-filter \
+  'filter="eq(is_root, true)",'
+
+# Drop the trailing Clean up cells: they delete the rules the Check reads.
+"${VENV_BIN}/python" - <<'CUTEOF'
+import json
+p = "/tmp/14_online_evals.solved.ipynb"
+nb = json.load(open(p))
+cut = next(i for i, c in enumerate(nb["cells"]) if "## Clean up" in "".join(c["source"]))
+nb["cells"] = nb["cells"][:cut]
+json.dump(nb, open(p, "w"), indent=1)
+CUTEOF
+
+# --- run the notebook -------------------------------------------------------- #
+# Executed from /tmp: the notebook's Setup cell uses absolute paths, because
+# nbconvert runs the kernel in the input notebook's own directory.
+cd /tmp
+timeout --kill-after=10 600 "${VENV_BIN}/jupyter" nbconvert \
+  --to notebook \
+  --execute \
+  --ExecutePreprocessor.timeout=500 \
+  --output-dir /tmp \
+  --output 14_online_evals.executed.ipynb \
+  /tmp/14_online_evals.solved.ipynb
+
+echo "solve: challenge 14 blank filled and notebook executed (rules left in place)"

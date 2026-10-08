@@ -1,0 +1,54 @@
+#!/bin/bash
+#
+# Check — challenge 4 (backends-and-memory)
+#
+# No strict set flags (house default): every probe is handled explicitly so the
+# fail-message always reaches the learner instead of the script dying on an
+# unset variable.
+#
+# The pass condition reads the actual persistence layer directly: the SQLite
+# file StoreBackend writes through. A notebook that merely executed, or a
+# model that merely claimed to remember something, is not enough — only a
+# real row in that database proves it.
+#
+# Time budget: one local SQLite read, no network. Well inside the ~60s ceiling.
+
+_fail() {
+  fail-message "$1" 2>/dev/null || echo "FAIL: $1" >&2
+  exit 1
+}
+
+ENV_FILE=/opt/workshop/.env
+VENV_PY=/opt/workshop/.venv/bin/python
+
+if [ ! -f "$ENV_FILE" ]; then
+  _fail "Setup hasn't finished yet. Wait a moment and click Check again."
+fi
+
+# [Check 1/2] prerequisites from challenge 1, worded gently: skipping is
+# enabled, so a learner can legitimately arrive here without having done it.
+if ! grep -q '^LANGSMITH_API_KEY=lsv2_' "$ENV_FILE"; then
+  _fail "[Check 1/2] No LangSmith key stored. Run the first cell of 01_setup.ipynb to enter one."
+fi
+if ! grep -q '^TAVILY_API_KEY=tvly-' "$ENV_FILE"; then
+  _fail "[Check 1/2] No Tavily key stored. This agent still searches the web — re-run the first cell of 01_setup.ipynb and enter one."
+fi
+
+# [Check 2/2] the live assertion: a real memory persisted to disk.
+"$VENV_PY" /opt/instruqt-workshop/check_backends_memory.py
+rc=$?
+
+case "$rc" in
+  0)
+    exit 0
+    ;;
+  2)
+    _fail "[Check 2/2] No memory database found yet. Run the cell that defines open_memory_store() and store, then the Thread 1 cell."
+    ;;
+  6)
+    _fail "[Check 2/2] The database exists, but nothing in it mentions the saved fact. Make sure 'backend=backend,' and 'store=store,' are uncommented AND the system_prompt is replaced with the one in the instructions, then re-run the create_deep_agent cell and both thread cells."
+    ;;
+  *)
+    _fail "[Check 2/2] Couldn't read the memory database. Re-run the cell that defines open_memory_store(), then the two thread cells."
+    ;;
+esac

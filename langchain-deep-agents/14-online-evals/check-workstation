@@ -1,0 +1,60 @@
+#!/bin/bash
+#
+# Check — challenge 14 (online-evals)
+#
+# No strict set flags (house default): every probe is handled explicitly so the
+# fail-message always reaches the learner instead of the script dying on an
+# unset variable.
+#
+# Reads both run rules back from the learner's tracing project
+# (check_langsmith.py rules). The online rule's filter must be root-only, which
+# only the blanked line sets. Online-eval SCORES are not checked: the judge runs
+# inside LangSmith on the learner's own OPENAI_API_KEY workspace secret.
+#
+# Time budget: a few bounded LangSmith queries, well inside the ~60s ceiling;
+# a killed check never shows its message.
+
+_fail() {
+  fail-message "$1" 2>/dev/null || echo "FAIL: $1" >&2
+  exit 1
+}
+
+ENV_FILE=/opt/workshop/.env
+VENV_PY=/opt/workshop/.venv/bin/python
+
+if [ ! -f "$ENV_FILE" ]; then
+  _fail "Setup hasn't finished yet. Wait a moment and click Check again."
+fi
+
+# [Check 1/2] a LangSmith key is stored. This challenge requires one.
+if [ ! -f /tmp/.credentials-ok ] || ! grep -q '^LANGSMITH_API_KEY=lsv2_' "$ENV_FILE"; then
+  _fail "[Check 1/2] This challenge needs a LangSmith key. Re-run the first cell of 01_setup.ipynb and enter one, then re-run 14_online_evals.ipynb from the top."
+fi
+
+# [Check 2/2] the live assertion, read from the learner's workspace.
+timeout --kill-after=3 50 "$VENV_PY" /opt/instruqt-workshop/check_langsmith.py rules
+rc=$?
+
+case "$rc" in
+  0)
+    exit 0
+    ;;
+  11)
+    _fail "[Check 2/2] The rule workshop-online-correctness is missing from your tracing project. Run the cell under '1. Online eval rule'. If you ran the Clean up cell, run it again."
+    ;;
+  12)
+    _fail "[Check 2/2] Your online eval rule scores every run, not just root traces. Uncomment 'filter=\"eq(is_root, true)\",' under '1. Online eval rule' and run the cell again. It replaces the rule."
+    ;;
+  13)
+    _fail "[Check 2/2] The rule workshop-route-correctness is missing. Run the cells under '2' and '3'."
+    ;;
+  3)
+    _fail "[Check 2/2] No LangSmith key is stored. Re-run the first cell of 01_setup.ipynb and enter one."
+    ;;
+  124 | 137)
+    _fail "[Check 2/2] LangSmith didn't answer in time. Usually a slow moment, not your work — click Check again."
+    ;;
+  *)
+    _fail "[Check 2/2] Couldn't read your LangSmith workspace. Re-run the last cell of 01_setup.ipynb to confirm the connection, then click Check again."
+    ;;
+esac

@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+# Check — challenge 1 (setup)
+# No strict set flags in check scripts (house default): every probe is
+# explicitly handled so fail-messages always reach the learner instead of the
+# script dying on an unset variable.
+#
+# This check needs no network and no credentials of its own. The learner's key
+# is validated LIVE at the moment it is entered — the notebook's getpass cell
+# calls LangSmith and refuses to store a key that does not authenticate, so a
+# key present in .env has already been proven to work. This check confirms that
+# happened; it never reads or echoes the value.
+#
+# Adapted from the sibling track langchain-langgraph-langsmith-ext
+# (01-connect-and-orient), same getpass credential model.
+
+_fail() {
+  fail-message "$1" 2>/dev/null || echo "FAIL: $1" >&2
+  exit 1
+}
+
+ENV_FILE=/opt/workshop/.env
+
+if [ ! -f "$ENV_FILE" ]; then
+  _fail "Setup hasn't finished yet. Wait a moment and click Check again."
+fi
+
+# [Check 1/5] the getpass cell ran (with a key that authenticated, or with
+# LangSmith skipped -- both are valid)
+if [ ! -f /tmp/.credentials-ok ]; then
+  _fail "[Check 1/5] Run the first code cell of 01_setup.ipynb on the Notebook tab. Enter your keys, or press Enter to skip them."
+fi
+
+if grep -q '^LANGSMITH_API_KEY=' "$ENV_FILE"; then
+  # [Check 2/5] a well-formed key was actually stored
+  if ! grep -q '^LANGSMITH_API_KEY=lsv2_' "$ENV_FILE"; then
+    _fail "[Check 2/5] No valid LangSmith key is stored yet. Re-run the first cell of 01_setup.ipynb — LangSmith keys start with 'lsv2_'."
+  fi
+
+  # [Check 3/5] tracing was switched on, and the sandbox has its own project
+  # The project base comes from config.yml, so read it rather than hardcoding it —
+  # a derived track (e.g. a TEST copy) sets its own and must still pass this.
+  PROJECT_BASE="$(grep '^WORKSHOP_PROJECT_BASE=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)"
+  [ -n "$PROJECT_BASE" ] || PROJECT_BASE="instruqt-deep-agents"
+  if ! grep -q '^LANGSMITH_TRACING=true' "$ENV_FILE" || \
+     ! grep -q "^LANGSMITH_PROJECT=${PROJECT_BASE}-" "$ENV_FILE"; then
+    _fail "[Check 3/5] Tracing is not switched on. Re-run the first cell of 01_setup.ipynb."
+  fi
+
+  # [Check 3/5b] the region probe ran. LangSmith is regional and a key only
+  # authenticates in its own region; the first cell probes US/EU/APAC/AWS and
+  # stores the winner. Without this line every later Check queries the US API,
+  # which for a non-US learner fails with "no traces found" and no way to tell why.
+  if ! grep -q '^LANGSMITH_ENDPOINT=https://' "$ENV_FILE"; then
+    _fail "[Check 3/5] No LangSmith region was detected. Re-run the first cell of 01_setup.ipynb — it checks your key against each region and stores the one it belongs to."
+  fi
+else
+  # [Check 2-3/5] LangSmith skipped: tracing must be off, or the tracer would
+  # try to send runs with no key.
+  if ! grep -q '^LANGSMITH_TRACING=false' "$ENV_FILE"; then
+    _fail "[Check 3/5] No LangSmith key is stored, but tracing is not switched off. Re-run the first cell of 01_setup.ipynb."
+  fi
+fi
+
+# [Check 4/5] the kernel really executed the model cell, AND the model answered.
+# Two sentinels, because those are two different failures with two different
+# fixes. `.setup-kernel-ok` is written as the cell starts, before the model is
+# called; `.setup-ok` only once the model has answered. Telling the learner to
+# re-run a cell they just ran is the failure mode this replaces.
+#
+# The second test is what keeps this check honest: a sandbox whose Bedrock
+# access is dead still fails here. It just says so, instead of blaming the
+# learner.
+if [ ! -f /tmp/.setup-kernel-ok ] && [ ! -f /tmp/.setup-ok ]; then
+  _fail "[Check 4/5] Run the code cell under '3. Call the model' in 01_setup.ipynb."
+fi
+if [ ! -f /tmp/.setup-ok ]; then
+  _fail "[Check 4/5] That cell ran, but Claude on Bedrock never answered — this one is the model, not you. Run the cell again; if it still fails, the traceback underneath it names the reason."
+fi
+
+# [Check 5/5] the independent verification cell really ran
+if [ ! -f /tmp/.verify-connection-ok ]; then
+  _fail "[Check 5/5] Run the last cell of 01_setup.ipynb, under '4. Verify the LangSmith connection'."
+fi
+
+echo "Credentials stored (or skipped), kernel and model confirmed working."
+exit 0

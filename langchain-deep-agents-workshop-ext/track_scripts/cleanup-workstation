@@ -1,0 +1,35 @@
+#!/bin/bash
+#
+# Track-level cleanup — langchain-deep-agents-workshop-ext
+#
+# Deliberately does NOT delete anything in LangSmith.
+#
+# Learners bring their own API keys, so the tracing project and every trace in
+# it belong to the learner's own workspace, not to us. Challenge 1 tells them
+# their traces "stay yours after the workshop ends" — deleting them here would
+# break that promise and destroy data we do not own.
+#
+# Everything this track actually created is inside the sandbox — the workshop
+# tree, the .env holding the learner's keys, and the AWS credentials Instruqt
+# provisioned — and all of it is destroyed with the VM.
+#
+# Verbatim from the sibling track langchain-langgraph-langsmith-ext (same
+# getpass credential model), git branch adlc-101-slice-0.
+#
+set -euo pipefail
+
+echo "##################################################"
+echo "# running track_scripts/cleanup-workstation      #"
+echo "##################################################"
+
+# Best-effort shred of the learner's keys, so their credentials do not linger in
+# a disk image any longer than they must. The VM is destroyed regardless; this
+# only narrows the window.
+for f in /opt/workshop/.env /etc/instruqt-workshop.env /root/.aws/credentials; do
+  if [ -f "$f" ]; then
+    shred -u "$f" 2>/dev/null || rm -f "$f"
+    echo "cleanup: removed $f"
+  fi
+done
+
+echo "cleanup complete — no LangSmith artifacts touched (they belong to the learner)"

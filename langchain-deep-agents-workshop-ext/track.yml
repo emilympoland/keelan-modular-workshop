@@ -1,0 +1,41 @@
+slug: langchain-deep-agents-workshop-ext
+id: nggh8rwoocjm
+title: '[Modular] Deep Agents 101 - Build a Complete Deep Agent'
+teaser: 'Build a research agent with create_deep_agent(): files, subagents, memory,
+  middleware, human-in-the-loop, and skills. Each challenge is checked against LangSmith
+  or the sandbox.'
+description: |-
+  Learn how to build long-running agents for complex workflows with Deep Agents, LangChain's
+  open-source agent harness. In this hands-on workshop, you'll build a research agent that
+  plans its work, delegates to subagents, remembers what it learns, and asks for your
+  approval before it takes action. You'll build up from a single `create_deep_agent()` call and
+  add one capability per challenge, using LangSmith to trace every step.
+
+  Each challenge is graded using your LangSmith traces and sandbox, so it checks that your
+  code ran.
+
+  Based on LangChain's [modular-workshops curriculum](https://github.com/langchain-ai/modular-workshops/tree/main/modules).
+icon: ./assets/langchain-icon.png
+level: intermediate
+tags:
+- modular-workshops-series
+owner: langchain
+developers:
+- ariel.herrera@langchain.dev
+show_timer: true
+skipping_enabled: true
+idle_timeout: 900
+timelimit: 7200
+lab_config:
+  sidebar_enabled: true
+  feedback_recap_enabled: true
+  feedback_tab_enabled: false
+  loadingMessages: true
+  theme:
+    name: modern-dark
+  override_challenge_layout: false
+  hideStopButton: false
+  default_layout: AssignmentRight
+  default_layout_sidebar_size: 40
+checksum: "9060691897000677279"
+enhanced_loading: false

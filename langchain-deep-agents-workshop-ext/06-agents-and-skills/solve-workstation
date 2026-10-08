@@ -1,0 +1,49 @@
+#!/bin/bash
+#
+# Solve — challenge 6 (agents-and-skills)
+#
+# This challenge has one genuinely blank cell (comment out system_prompt,
+# uncomment memory=/skills=), so the learner's notebook cannot simply be
+# executed. So the solve fills the blank first, by cell TAG, writing a copy
+# to /tmp — the learner's own notebook is never modified. Executing that
+# copy for real is still the only automated proof that every other cell in
+# the notebook runs, and that the filled cell is a correct solution.
+#
+# Full-chain defensive: skipping is enabled, so this may run without earlier
+# challenges having been played. It seeds credentials first.
+#
+# Idempotent: re-running refills the blank and re-executes, overwriting the
+# same real output.
+#
+# Adapted from the sibling track langchain-langgraph-langsmith-ext
+# (04-the-five-line-version), same fill-by-tag-then-execute-from-/tmp pattern.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+VENV_BIN="${WORKSHOP_DIR}/.venv/bin"
+
+# --- credentials, exactly as challenge 1's getpass cell would leave them ----- #
+"${VENV_BIN}/python" "${OPS_DIR}/seed_credentials.py"
+
+# --- fill the blanked cell -------------------------------------------------- #
+"${VENV_BIN}/python" "${OPS_DIR}/fill_challenge6_blank.py"
+
+# --- run the filled notebook ------------------------------------------------ #
+# Executed from /tmp, which is why this notebook's Setup cell (and MEMORY_DB)
+# use absolute paths: nbconvert runs the kernel in the input notebook's own
+# directory.
+#
+# This run can delegate to the research subagent AND pause for HITL approval
+# (interrupt_on is still active from challenge 5), so the timeout budget
+# matches the largest prior challenge's.
+cd /tmp
+timeout --kill-after=10 600 "${VENV_BIN}/jupyter" nbconvert \
+  --to notebook \
+  --execute \
+  --ExecutePreprocessor.timeout=360 \
+  --output-dir /tmp \
+  --output 06_agents_and_skills.executed.ipynb \
+  /tmp/06_agents_and_skills.solved.ipynb
+
+echo "solve: challenge 6 blank filled and notebook executed end to end"

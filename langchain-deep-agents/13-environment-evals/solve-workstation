@@ -1,0 +1,40 @@
+#!/bin/bash
+#
+# Solve — challenge 13 (environment-evals)
+#
+# No blank: executes the notebook for real. RUN_HARBOR stays False, so the
+# optional Harbor job is skipped; the local agent run and the verifier (which
+# writes the sentinel the Check reads) both run. No LangSmith key needed.
+#
+# Idempotent: the scratch workspace is recreated on every run.
+#
+# Full-chain defensive: skipping is enabled, so this may run without earlier
+# challenges having been played. It seeds credentials first.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+VENV_BIN="${WORKSHOP_DIR}/.venv/bin"
+
+# --- credentials, exactly as challenge 1's getpass cell would leave them ----- #
+"${VENV_BIN}/python" "${OPS_DIR}/seed_credentials.py"
+
+cp /opt/workshop/instruqt/13_environment_evals.ipynb /tmp/13_environment_evals.solved.ipynb
+
+# --- run the notebook -------------------------------------------------------- #
+# Executed from /tmp: the notebook's Setup cell uses absolute paths, because
+# nbconvert runs the kernel in the input notebook's own directory.
+cd /tmp
+timeout --kill-after=10 500 "${VENV_BIN}/jupyter" nbconvert \
+  --to notebook \
+  --execute \
+  --ExecutePreprocessor.timeout=400 \
+  --output-dir /tmp \
+  --output 13_environment_evals.executed.ipynb \
+  /tmp/13_environment_evals.solved.ipynb
+
+# This ran as root, so hand the scratch workspace back to the kernel's user, or
+# the learner's own re-run can't delete and re-seed it.
+chown -R workshop:workshop "${WORKSHOP_DIR}/.dev-workspace"
+
+echo "solve: challenge 13 notebook executed end to end"

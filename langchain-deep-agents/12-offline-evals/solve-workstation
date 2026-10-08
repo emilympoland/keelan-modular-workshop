@@ -1,0 +1,29 @@
+#!/bin/bash
+#
+# Solve — challenge 12 (offline-evals)
+#
+# Targeted, unlike the other solves: the notebook runs two full experiments over
+# four research tasks, which doesn't fit a lifecycle script's time budget.
+# solve_offline_evals.py builds only what the Check reads -- the dataset and ONE
+# scored trajectory experiment (the blanked cell, filled) -- with the notebook's
+# names and code. Without a LangSmith key it warns and exits 0.
+#
+# Idempotent: the dataset is recreated; each run adds one experiment.
+#
+# Full-chain defensive: skipping is enabled, so this may run without earlier
+# challenges having been played. It seeds credentials first.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+VENV_BIN="${WORKSHOP_DIR}/.venv/bin"
+
+# --- credentials, exactly as challenge 1's getpass cell would leave them ----- #
+"${VENV_BIN}/python" "${OPS_DIR}/seed_credentials.py"
+
+# --- the graded LangSmith objects ------------------------------------------ #
+# Four research-agent runs at concurrency 4, plus a few API calls.
+cd "$WORKSHOP_DIR"
+timeout --kill-after=10 600 "${VENV_BIN}/python" "${OPS_DIR}/solve_offline_evals.py"
+
+echo "solve: challenge 12 dataset and scored trajectory experiment created"

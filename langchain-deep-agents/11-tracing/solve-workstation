@@ -1,0 +1,46 @@
+#!/bin/bash
+#
+# Solve — challenge 11 (tracing)
+#
+# Fills the blanked latency filter, then executes the notebook for real:
+# three named warm-up runs, then the queries (whose confirm cell writes the
+# sentinel the Check reads).
+#
+# Idempotent: re-running adds three more warm-up runs.
+#
+# Full-chain defensive: skipping is enabled, so this may run without earlier
+# challenges having been played. It seeds credentials first.
+set -euo pipefail
+
+WORKSHOP_DIR=/opt/workshop
+OPS_DIR=/opt/instruqt-workshop
+VENV_BIN="${WORKSHOP_DIR}/.venv/bin"
+
+# --- credentials, exactly as challenge 1's getpass cell would leave them ----- #
+"${VENV_BIN}/python" "${OPS_DIR}/seed_credentials.py"
+
+# Needs a LangSmith key (the notebook's Setup cell refuses to run without one).
+# Without it, warn and exit 0 so a learner who pressed Skip isn't left stuck.
+if ! grep -q '^LANGSMITH_API_KEY=lsv2_' "${WORKSHOP_DIR}/.env"; then
+  echo "SOLVE WARNING: no LangSmith key stored; this challenge needs one. Nothing run." >&2
+  exit 0
+fi
+
+# --- fill the blanked cell (into a /tmp copy; the learner's is untouched) --- #
+"${VENV_BIN}/python" "${OPS_DIR}/fill_blank.py" \
+  /opt/workshop/instruqt/11_tracing.ipynb /tmp/11_tracing.solved.ipynb instruqt-blank-latency-filter \
+  'filter="gt(latency, 5)",'
+
+# --- run the notebook -------------------------------------------------------- #
+# Executed from /tmp: the notebook's Setup cell uses absolute paths, because
+# nbconvert runs the kernel in the input notebook's own directory.
+cd /tmp
+timeout --kill-after=10 500 "${VENV_BIN}/jupyter" nbconvert \
+  --to notebook \
+  --execute \
+  --ExecutePreprocessor.timeout=400 \
+  --output-dir /tmp \
+  --output 11_tracing.executed.ipynb \
+  /tmp/11_tracing.solved.ipynb
+
+echo "solve: challenge 11 blank filled and notebook executed end to end"
